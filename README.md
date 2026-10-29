@@ -577,6 +577,10 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
   brew install sqlite
   ```
 
+### ONNX Embeddings (opt-in, separate backend)
+
+QMD supports a selectable ONNX embedding backend (CPU by default) alongside the existing GGUF workflow. ONNX is opt-in; the shipped default embedding model (`embeddinggemma-300M-Q8_0` GGUF) does not change. When ONNX is configured (`backend: "onnx"`), the descriptor must specify an immutable source/revision and a validated `EmbeddingRecipe` (pooling, normalization, prefixes, chunking; `"sentence-output"` additionally requires `sentenceOutput`, and `"cls"` requires `clsTokenIndex`); `dtype` defaults to `fp32` and `dimensions` may be omitted (then measured from the native output — dimension reduction is not supported, the persisted space must equal the native output). Same dimensions with a different descriptor (recipe/source/dtype) are incompatible and rejected; one space per DB. CPU-only (`device: "cpu"`) disables LLM query expansion and neural reranking — original-query BM25 + vector deterministic fusion only, with explicit stage-enable conflict errors; accelerated ONNX retains independent stage settings. Offline is the default acquisition policy (`allowDownload: false`; cache misses fail preflight fail-closed). Localization/path rules: inline SDK needs absolute paths; relative local paths resolve against the config file directory. A documented MiniLM-compatible recipe (mean pooling, `l2`, 256 total / 32 title / 24 overlap, no prefixes) is explanation only; a usable published HF example requires a verified immutable revision selected in the deferred T18 runtime-qualification task — local authorized directory configuration is shown instead. No all-zero/fake SHA is presented as a model reference; CLS/last-token/sentence-output are bounded recipes, not universal semantics.
+
 ### GGUF Models (via node-llama-cpp)
 
 QMD uses three local GGUF models (auto-downloaded on first use):

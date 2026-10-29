@@ -3,7 +3,8 @@
  */
 
 import { describe, test, expect, afterEach } from "vitest";
-import { openDatabase } from "../src/db.js";
+import { openDatabase, loadSqliteVec } from "../src/db.js";
+import BetterSQLite from "better-sqlite3";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -123,6 +124,44 @@ describe("openDatabase", () => {
       }
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("openDatabase uses better-sqlite3 under both runtimes", () => {
+    const db = openDatabase(":memory:");
+    try {
+      expect(db).toBeInstanceOf(BetterSQLite);
+      expect(db.constructor).toBe(BetterSQLite);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("loadSqliteVec uses better-sqlite3 sqliteVec.load path; exercises SELECT vec_version", () => {
+    const db = openDatabase(":memory:");
+    try {
+      loadSqliteVec(db);
+      const row = db.prepare("SELECT vec_version() AS version").get<{ version: string }>();
+      expect(row?.version).toEqual(expect.any(String));
+      expect(row?.version.length).toBeGreaterThan(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("transaction rolls back on error", () => {
+    const db = openDatabase(":memory:");
+    try {
+      db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+      const tx = db.transaction(() => {
+        db.prepare("INSERT INTO t (id) VALUES (?)").run(1);
+        throw new Error("abort");
+      });
+      expect(() => tx()).toThrow("abort");
+      const count = db.prepare("SELECT COUNT(*) as c FROM t").get() as { c: number };
+      expect(count.c).toBe(0);
+    } finally {
+      db.close();
     }
   });
 });

@@ -32,8 +32,10 @@
     "test": "node scripts/test-all.mjs",
     "test:types": "node ./node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit",
     "test:node": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000",
-    "test:bun": "bun test --timeout 60000 --preload ./src/test-preload.ts",
+    "test:bun": "node scripts/test-bun.mjs",
     "test:unit": "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/ && CI=true bun test --timeout 60000 --preload ./src/test-preload.ts test/",
+    "test:sqlite-memory": "node scripts/test-sqlite-memory.mjs",
+    "test:oxlint": "node scripts/test-oxlint.mjs",
     "test:package": "node scripts/package-smoke.mjs",
     "qmd": "tsx src/cli/qmd.ts",
     "index": "tsx src/cli/qmd.ts index",
@@ -57,6 +59,7 @@
     "url": "https://github.com/tobi/qmd/issues"
   },
   "dependencies": {
+    "@huggingface/transformers": "4.3.1",
     "@modelcontextprotocol/server": "2.0.0",
     "better-sqlite3": "^13.0.3",
     "fast-glob": "3.3.3",

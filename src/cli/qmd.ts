@@ -9,6 +9,11 @@ import { basename, dirname, join as pathJoin, relative as relativePath, resolve 
 import { parseArgs } from "util";
 import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
 import { createInterface } from "readline/promises";
+import { availableParallelism } from "node:os";
+import { resolveEmbeddingConfig, resolveSearchStagePolicy } from "../embeddings/config.js";
+import { approveEntryConfig } from "../embeddings/entry-config.js";
+import { configureStoreEmbeddings, inspectStoreEmbeddings, EmbeddingCompatibilityUnverifiedError } from "../store.js";
+import type { ResolvedEmbeddingConfig } from "../embeddings/types.js";
 import {
   getPwd,
   getRealPath,
@@ -168,28 +173,52 @@ import {
 let store: ReturnType<typeof createStore> | null = null;
 let storeDbPathOverride: string | undefined;
 let currentIndexName = "index";
+let capturedConfig: CollectionConfig | undefined;
+let capturedConfigPath: string | undefined;
+let capturedModels: ReturnType<typeof resolveModels> | undefined;
+let capturedModelDefaults: ReturnType<typeof resolveModels> | undefined;
 
-function getStore(): ReturnType<typeof createStore> {
+function freezeCliConfig(value: unknown, seen = new WeakSet<object>()): void {
+  if (value === null || typeof value !== "object" || seen.has(value)) return;
+  seen.add(value);
+  for (const child of Object.values(value)) freezeCliConfig(child, seen);
+  Object.freeze(value);
+}
+
+function getStore(suppliedConfig?: CollectionConfig): ReturnType<typeof createStore> {
   if (!store) {
-    store = createStore(storeDbPathOverride);
-    // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    const configPath = getConfigPath();
+    const config = structuredClone(suppliedConfig !== undefined ? suppliedConfig : loadConfig());
+    freezeCliConfig(config);
+    const defaults = Object.freeze(resolveModels());
+    const models = Object.freeze(resolveModels({
+      embed: typeof config.models?.embed === "string" ? config.models.embed || defaults.embed : defaults.embed,
+      generate: config.models?.generate || defaults.generate,
+      rerank: config.models?.rerank || defaults.rerank,
+    }));
+    const decision = decideLocalConfigGate({
+      configPath, snapshot: collectSensitiveSnapshot(config, configPath), builtins: builtinModels(), isInteractive: false,
+    });
+    const activeModels = decision.action === "run" ? models : defaults;
+    const opened = createStore(storeDbPathOverride);
     try {
-      const activeModels = ensureModelsConfiguredForCli();
-      const config = loadConfig();
-      syncConfigToDb(store.db, config);
-      // Untrusted project-local custom model URIs must not be loaded; status
-      // still displays the YAML values via resolveModelsForCli (#889).
-      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
+      syncConfigToDb(opened.db, config);
+      // Construction is lazy. Lexical callers retain synchronous DB ownership;
+      // vector callers take async model ownership before any approval or work.
       const llm = new LlamaCpp({
-        embedModel: modelsForLlm.embed,
-        generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
+        embedModel: activeModels.embed, generateModel: activeModels.generate, rerankModel: activeModels.rerank,
       });
+      opened.llm = llm;
       setDefaultLlamaCpp(llm);
-      store.llm = llm;
-    } catch {
-      // Config may not exist yet — that's fine, DB works without it
+    } catch (error) {
+      try { opened.close(); } catch { /* Preserve the construction failure. */ }
+      throw error;
     }
+    capturedConfig = config;
+    capturedConfigPath = configPath;
+    capturedModels = models;
+    capturedModelDefaults = defaults;
+    store = opened;
   }
   return store;
 }
@@ -215,7 +244,60 @@ function closeDb(): void {
   if (store) {
     store.close();
     store = null;
+    capturedConfig = undefined;
+    capturedConfigPath = undefined;
+    capturedModels = undefined;
+    capturedModelDefaults = undefined;
   }
+}
+
+/** Awaited async close for async vector operations; never fire-and-forget. */
+async function closeDbAsync(): Promise<void> {
+  const captured = store;
+  if (!captured) return;
+  try {
+    await captured.closeAsync();
+  } catch {
+    throw new Error("Store resource cleanup failed");
+  }
+  if (store === captured) {
+    store = null;
+    capturedConfig = undefined;
+    capturedConfigPath = undefined;
+    capturedModels = undefined;
+    capturedModelDefaults = undefined;
+  }
+}
+
+async function getVectorStore(): Promise<ReturnType<typeof createStore>> {
+  const s = getStore();
+  if (s.embedding) return s;
+  s.ownsLlm = true;
+  if (!capturedConfig || !capturedConfigPath || !capturedModels || !capturedModelDefaults) {
+    throw new Error("Store configuration capture is unavailable");
+  }
+  const config = capturedConfig;
+  const configPath = capturedConfigPath;
+  const models = capturedModels;
+  const defaults = capturedModelDefaults;
+  const allowed = await resolveLocalConfigTrust(config, configPath);
+  let embedding: ResolvedEmbeddingConfig;
+  const configuredEmbed = config.models?.embed;
+  if (configuredEmbed !== undefined && typeof configuredEmbed !== "string") {
+    embedding = approveEntryConfig(configPath, config, builtinModels(), false).embedding;
+  } else {
+    embedding = Object.freeze({ backend: "gguf", model: (allowed ? models : defaults).embed });
+  }
+  const activeModels = allowed ? models : defaults;
+  if (s.llm?.embedModelName !== activeModels.embed || s.llm.generateModelName !== activeModels.generate || s.llm.rerankModelName !== activeModels.rerank) {
+    await s.llm?.dispose();
+    s.llm = new LlamaCpp({
+      embedModel: activeModels.embed, generateModel: activeModels.generate, rerankModel: activeModels.rerank,
+    });
+    setDefaultLlamaCpp(s.llm);
+  }
+  configureStoreEmbeddings(s, embedding);
+  return s;
 }
 
 function getDbPath(): string {
@@ -376,8 +458,15 @@ function formatETA(seconds: number): string {
 
 
 // Check index health and print warnings/tips
-function checkIndexHealth(db: Database, model: string = resolveEmbedModelForCli()): void {
-  const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db, model);
+function checkIndexHealth(db: Database, model: string = resolveEmbedModelForCli(), bound?: ReturnType<typeof createStore>): void {
+  let health: ReturnType<typeof getIndexHealth>;
+  try { health = bound ? bound.getIndexHealth(model) : getIndexHealth(db, model); }
+  catch (error) {
+    if (!(error instanceof EmbeddingCompatibilityUnverifiedError)) throw error;
+    process.stderr.write(`${c.dim}Tip: embedding producer compatibility is unverified; health counts are unavailable until the selected producer is prepared by vector work.${c.reset}\n`);
+    return;
+  }
+  const { needsEmbedding, totalDocs, daysStale } = health;
 
   // Warn if many docs need embedding
   if (needsEmbedding > 0) {
@@ -745,18 +834,28 @@ function builtinModels(): BuiltinModels {
  * Read from the YAML rather than the synced SQLite copy so `qmd trust`
  * and `qmd update` always digest the same set.
  */
-function collectSensitiveSnapshot(): SensitiveSnapshot {
-  const config = loadConfig();
+function collectSensitiveSnapshot(config: CollectionConfig = loadConfig(), configPath: string = getConfigPath()): SensitiveSnapshot {
+  const configuredEmbed = config.models?.embed;
+  let embed: SensitiveSnapshot["models"]["embed"];
+  if (configuredEmbed === undefined || typeof configuredEmbed === "string") embed = configuredEmbed;
+  else {
+    const resolved = resolveEmbeddingConfig(configuredEmbed, {
+      configPath, defaultGgufModel: DEFAULT_EMBED_MODEL, hostParallelism: availableParallelism(),
+    });
+    switch (resolved.backend) {
+      case "onnx": embed = resolved; break;
+      case "gguf": throw new Error("Structured embedding configuration must select ONNX");
+      default: { const exhaustive: never = resolved; throw new Error(`Unsupported embedding configuration: ${exhaustive}`); }
+    }
+  }
   return {
-    hooks: Object.entries(config.collections ?? {})
-      .filter(([, col]) => !!col.update)
-      .map(([name, col]) => ({ collection: name, command: col.update! })),
+    hooks: Object.entries(config.collections).flatMap(([collection, value]) => value.update ? [{ collection, command: value.update }] : []),
     paths: Object.entries(config.collections ?? {}).map(([name, col]) => ({
       collection: name,
       path: col.path,
     })),
     models: {
-      embed: config.models?.embed,
+      embed,
       rerank: config.models?.rerank,
       generate: config.models?.generate,
     },
@@ -828,9 +927,8 @@ function printGatedItems(gated: GatedItems): void {
  * Returns false when those must be skipped — in-project indexing still
  * proceeds, since that is what the caller asked for.
  */
-async function resolveLocalConfigTrust(): Promise<boolean> {
-  const configPath = getConfigPath();
-  const snapshot = collectSensitiveSnapshot();
+async function resolveLocalConfigTrust(config: CollectionConfig = loadConfig(), configPath: string = getConfigPath()): Promise<boolean> {
+  const snapshot = collectSensitiveSnapshot(config, configPath);
   const gated = localConfigGated(configPath, snapshot);
   if (!hasGatedItems(gated)) return true;
 
@@ -2342,24 +2440,18 @@ function parseEmbedTimeoutOption(value: unknown): number | undefined {
 }
 
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
-  try {
-    const config = loadConfig();
-    const models = resolveModels(config.models);
-    const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
-    }
-    return models;
-  } catch {
-    return resolveModels();
+  const config = loadConfig();
+  const embed = config.models?.embed;
+  // Display resolution is read-only; only explicit config commands persist values.
+  const models = resolveModels({
+    embed: typeof embed === "string" ? embed : undefined,
+    generate: config.models?.generate, rerank: config.models?.rerank,
+  });
+  if (embed === undefined || typeof embed === "string") return models;
+  switch (embed.source.kind) {
+    case "huggingface": return { ...models, embed: embed.source.model };
+    case "local": return { ...models, embed: "local ONNX model" };
+    default: { const exhaustive: never = embed.source; throw new Error(`Unsupported model source: ${exhaustive}`); }
   }
 }
 
@@ -2382,38 +2474,40 @@ function resolveModelsForCli(): { embed: string; generate: string; rerank: strin
 /** Models that may actually be loaded. Falls back to defaults/env when a
  *  project-local config's custom URIs are not trusted (#889). */
 function resolveModelsForRuntime(): { embed: string; generate: string; rerank: string } {
-  const configured = ensureModelsConfiguredForCli();
-  if (localConfigIsFullyTrusted()) return configured;
-  return resolveModels();
+  const configPath = getConfigPath();
+  const config = loadConfig();
+  const embed = config.models?.embed;
+  if (embed !== undefined && typeof embed !== "string") {
+    approveEntryConfig(configPath, config, builtinModels(), false);
+    throw new Error("qmd pull supports GGUF models only; ONNX acquisition uses its approved allowDownload setting when embeddings are needed");
+  }
+  const defaults = resolveModels();
+  const configured = resolveModels({ embed, generate: config.models?.generate, rerank: config.models?.rerank });
+  const decision = decideLocalConfigGate({
+    configPath, snapshot: collectSensitiveSnapshot(config, configPath), builtins: builtinModels(), isInteractive: false,
+  });
+  return decision.action === "run" ? configured : defaults;
 }
 
 async function vectorIndex(
-  model: string = resolveEmbedModelForCli(),
   force: boolean = false,
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
 ): Promise<void> {
-  const storeInstance = getStore();
-  const db = storeInstance.db;
+  let embedLock: ReturnType<typeof tryAcquireEmbedLock> | undefined;
 
-  // Exclusive process lock — concurrent embeds race on vector_rows (#825)
-  const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
-  if (!embedLock) {
-    console.log(EMBED_LOCK_BUSY_MESSAGE);
-    closeDb();
-    return;
-  }
-
+  let operationFailed = false;
   try {
-    if (force) {
-      console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
-    }
-
-    // Check if there's work to do before starting
-    const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
-    if (hashesToEmbed === 0 && !force) {
-      console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
-      closeDb();
+    const storeInstance = await getVectorStore();
+    resolveCollectionFilter(batchOptions?.collection, false, capturedConfig);
+    const model = storeInstance.embedding?.modelLabel ?? storeInstance.llm?.embedModelName ?? DEFAULT_EMBED_MODEL;
+    // Lock acquired inside operation scope; failure closes opened store.
+    embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
+    if (!embedLock) {
+      console.log(EMBED_LOCK_BUSY_MESSAGE);
       return;
+    }
+    if (force) {
+      console.log(`${c.yellow}Force re-indexing: validating selected producer before clearing vectors...${c.reset}`);
     }
 
     console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
@@ -2486,9 +2580,16 @@ async function vectorIndex(
       }
     }
 
-    closeDb();
+  } catch (error) {
+    operationFailed = true;
+    throw error;
   } finally {
-    embedLock.release();
+    try {
+      try { await closeDbAsync(); }
+      catch (cleanupError) { if (!operationFailed) throw cleanupError; }
+    } finally {
+      embedLock?.release();
+    }
   }
 }
 
@@ -2913,17 +3014,19 @@ function describeVectorLayout(layout: VectorTableLayout): string {
 
 // Resolve -c collection filter: supports single string, array, or undefined.
 // Returns validated collection names (exits on unknown collection).
-function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
+function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false, config?: CollectionConfig): string[] {
   // If no filter specified and useDefaults is true, use default collections
   if (!raw && useDefaults) {
+    if (config) return Object.entries(config.collections).filter(([, collection]) => collection.includeByDefault !== false).map(([name]) => name);
     return getDefaultCollectionNames();
   }
   if (!raw) return [];
   const names = Array.isArray(raw) ? raw : [raw];
   const validated: string[] = [];
   for (const name of names) {
-    const coll = getCollectionFromYaml(name);
+    const coll = config ? config.collections[name] : getCollectionFromYaml(name);
     if (!coll) {
+      if (config) throw new Error(`Collection not found: ${name}`);
       console.error(`Collection not found: ${name}`);
       closeDb();
       process.exit(1);
@@ -3136,181 +3239,204 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
 }
 
 async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
-  const store = getStore();
+  let operationFailed = false;
+  try {
+    const store = await getVectorStore();
 
-  // Validate collection filter (supports multiple -c flags)
-  // Use default collections if none specified
-  const collectionNames = resolveCollectionFilter(opts.collection, true);
+    // Validate collection filter (supports multiple -c flags)
+    // Use default collections if none specified
+    const collectionNames = resolveCollectionFilter(opts.collection, true, capturedConfig);
 
-  checkIndexHealth(store.db);
-  if (opts.filter) warnPendingMetadata(store.db, collectionNames);
+    checkIndexHealth(store.db, store.embedding?.modelLabel ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL, store);
+    if (opts.filter) warnPendingMetadata(store.db, collectionNames);
 
-  await withLLMSession(async () => {
-    let results = await vectorSearchQuery(store, query, {
-      collection: collectionSearchFilter(collectionNames),
-      filter: opts.filter,
-      limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0.3,
-      intent: opts.intent,
-      hooks: {
-        onExpand: (original, expanded) => {
-          logExpansionTree(original, expanded);
-          process.stderr.write(`${c.dim}Searching ${expanded.length + 1} vector queries...${c.reset}\n`);
-        },
-      },
-    });
-
-    closeDb();
-
-    if (results.length === 0) {
-      printEmptySearchResults(opts.format);
-      return;
-    }
-
-    outputResults(results.map(r => ({
-      file: r.file,
-      displayPath: r.displayPath,
-      title: r.title,
-      body: r.body,
-      score: r.score,
-      context: r.context,
-      docid: r.docid,
-      metadata: r.metadata,
-    })), query, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
-}
-
-async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
-  const store = getStore();
-
-  // Validate collection filter (supports multiple -c flags)
-  // Use default collections if none specified
-  const collectionNames = resolveCollectionFilter(opts.collection, true);
-
-  checkIndexHealth(store.db);
-  if (opts.filter) warnPendingMetadata(store.db, collectionNames);
-
-  // Check for structured query syntax (lex:/vec:/hyde:/intent: prefixes)
-  const parsed = parseStructuredQuery(query);
-  // Intent can come from --intent flag or from intent: line in query document
-  const intent = opts.intent || parsed?.intent;
-
-  await withLLMSession(async () => {
-    let results;
-
-    if (parsed) {
-      const structuredQueries = parsed.searches;
-      // Structured search — user provided their own query expansions
-      const typeLabels = structuredQueries.map(s => s.type).join('+');
-      process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
-      if (intent) {
-        process.stderr.write(`${c.dim}├─ intent: ${intent}${c.reset}\n`);
-      }
-
-      // Log each sub-query
-      for (const s of structuredQueries) {
-        let preview = s.query.replace(/\n/g, ' ');
-        if (preview.length > 72) preview = preview.substring(0, 69) + '...';
-        process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
-      }
-      process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
-
-      results = await structuredSearch(store, structuredQueries, {
-        collections: collectionNames.length > 0 ? collectionNames : undefined,
-        filter: opts.filter,
-        limit: opts.all ? 500 : (opts.limit || 10),
-        minScore: opts.minScore || 0,
-        candidateLimit: opts.candidateLimit,
-        skipRerank: opts.skipRerank,
-        explain: !!opts.explain,
-        intent,
-        chunkStrategy: opts.chunkStrategy,
-        hooks: {
-          onEmbedStart: (count) => {
-            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
-          },
-          onEmbedDone: (ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-          onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
-            progress.indeterminate();
-          },
-          onRerankDone: (ms) => {
-            progress.clear();
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-        },
-      });
-    } else {
-      // Standard hybrid query with automatic expansion
-      results = await hybridQuery(store, query, {
+    await withLLMSession(async () => {
+      let results = await vectorSearchQuery(store, query, {
         collection: collectionSearchFilter(collectionNames),
         filter: opts.filter,
         limit: opts.all ? 500 : (opts.limit || 10),
-        minScore: opts.minScore || 0,
-        candidateLimit: opts.candidateLimit,
-        skipRerank: opts.skipRerank,
-        explain: !!opts.explain,
-        intent,
-        chunkStrategy: opts.chunkStrategy,
+        minScore: opts.minScore || 0.3,
+        intent: opts.intent,
         hooks: {
-          onStrongSignal: (score) => {
-            process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
-          },
-          onExpandStart: () => {
-            process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
-          },
-          onExpand: (original, expanded, ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          onExpand: (original, expanded) => {
             logExpansionTree(original, expanded);
-            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
-          },
-          onEmbedStart: (count) => {
-            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
-          },
-          onEmbedDone: (ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-          onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
-            progress.indeterminate();
-          },
-          onRerankDone: (ms) => {
-            progress.clear();
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} vector queries...${c.reset}\n`);
           },
         },
       });
-    }
 
-    closeDb();
+      if (results.length === 0) {
+        printEmptySearchResults(opts.format);
+        return;
+      }
 
-    if (results.length === 0) {
-      printEmptySearchResults(opts.format);
-      return;
-    }
+      outputResults(results.map(r => ({
+        file: r.file,
+        displayPath: r.displayPath,
+        title: r.title,
+        body: r.body,
+        score: r.score,
+        context: r.context,
+        docid: r.docid,
+        metadata: r.metadata,
+      })), query, { ...opts, limit: results.length });
+    }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  } catch (error) {
+    operationFailed = true;
+    throw error;
+  } finally {
+    try { await closeDbAsync(); }
+    catch (cleanupError) { if (!operationFailed) throw cleanupError; }
+  }
+}
 
-    // Use first lex/vec query for output context, or original query
-    const structuredQueries = parsed?.searches;
-    const displayQuery = structuredQueries
-      ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
-      : query;
+async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+  let operationFailed = false;
+  try {
+    const store = await getVectorStore();
 
-    outputResults(results.map(r => ({
-      file: r.file,
-      displayPath: r.displayPath,
-      title: r.title,
-      body: r.body,
-      chunkPos: r.bestChunkPos,
-      chunkLen: r.bestChunk.length,
-      score: r.score,
-      context: r.context,
-      docid: r.docid,
-      metadata: r.metadata,
-      explain: r.explain,
-    })), displayQuery, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+    // Validate collection filter (supports multiple -c flags)
+    // Use default collections if none specified
+    const collectionNames = resolveCollectionFilter(opts.collection, true, capturedConfig);
+
+    checkIndexHealth(store.db, store.embedding?.modelLabel ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL, store);
+    if (opts.filter) warnPendingMetadata(store.db, collectionNames);
+
+    // Check for structured query syntax (lex:/vec:/hyde:/intent: prefixes)
+    const parsed = parseStructuredQuery(query);
+    // The parser's null result deliberately covers both implicit and explicit
+    // expansion. Preserve that public contract while retaining caller intent.
+    const explicitExpand = !parsed && /^expand:\s*/i.test(query.trim());
+    const searchQuery = explicitExpand ? query.trim().replace(/^expand:\s*/i, '').trim() : query;
+    const policy = resolveSearchStagePolicy(store.embeddingConfig ?? { backend: "gguf", model: DEFAULT_EMBED_MODEL }, {
+      expand: explicitExpand ? true : undefined,
+      rerank: opts.skipRerank === undefined ? undefined : !opts.skipRerank,
+    });
+    // Intent can come from --intent flag or from intent: line in query document
+    const intent = opts.intent || parsed?.intent;
+
+    await withLLMSession(async () => {
+      let results;
+
+      if (parsed) {
+        const structuredQueries = parsed.searches;
+        // Structured search — user provided their own query expansions
+        const typeLabels = structuredQueries.map(s => s.type).join('+');
+        process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
+        if (intent) {
+          process.stderr.write(`${c.dim}├─ intent: ${intent}${c.reset}\n`);
+        }
+
+        // Log each sub-query
+        for (const s of structuredQueries) {
+          let preview = s.query.replace(/\n/g, ' ');
+          if (preview.length > 72) preview = preview.substring(0, 69) + '...';
+          process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
+        }
+        process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
+
+        results = await structuredSearch(store, structuredQueries, {
+          collections: collectionNames.length > 0 ? collectionNames : undefined,
+          filter: opts.filter,
+          limit: opts.all ? 500 : (opts.limit || 10),
+          minScore: opts.minScore || 0,
+          candidateLimit: opts.candidateLimit,
+          skipRerank: !policy.rerank,
+          explain: !!opts.explain,
+          intent,
+          chunkStrategy: opts.chunkStrategy,
+          hooks: {
+            onEmbedStart: (count) => {
+              process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
+            },
+            onEmbedDone: (ms) => {
+              process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+            },
+            onRerankStart: (chunkCount) => {
+              process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
+              progress.indeterminate();
+            },
+            onRerankDone: (ms) => {
+              progress.clear();
+              process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+            },
+          },
+        });
+      } else {
+        // Standard hybrid query with automatic expansion
+        results = await hybridQuery(store, searchQuery, {
+          expand: policy.expand,
+          collection: collectionSearchFilter(collectionNames),
+          filter: opts.filter,
+          limit: opts.all ? 500 : (opts.limit || 10),
+          minScore: opts.minScore || 0,
+          candidateLimit: opts.candidateLimit,
+          skipRerank: !policy.rerank,
+          explain: !!opts.explain,
+          intent,
+          chunkStrategy: opts.chunkStrategy,
+          hooks: {
+            onStrongSignal: (score) => {
+              process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
+            },
+            onExpandStart: () => {
+              process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
+            },
+            onExpand: (original, expanded, ms) => {
+              process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+              logExpansionTree(original, expanded);
+              process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
+            },
+            onEmbedStart: (count) => {
+              process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
+            },
+            onEmbedDone: (ms) => {
+              process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+            },
+            onRerankStart: (chunkCount) => {
+              process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
+              progress.indeterminate();
+            },
+            onRerankDone: (ms) => {
+              progress.clear();
+              process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+            },
+          },
+        });
+      }
+
+      if (results.length === 0) {
+        printEmptySearchResults(opts.format);
+        return;
+      }
+
+      // Use first lex/vec query for output context, or original query
+      const structuredQueries = parsed?.searches;
+      const displayQuery = structuredQueries
+        ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
+        : query;
+
+      outputResults(results.map(r => ({
+        file: r.file,
+        displayPath: r.displayPath,
+        title: r.title,
+        body: r.body,
+        chunkPos: r.bestChunkPos,
+        chunkLen: r.bestChunk.length,
+        score: r.score,
+        context: r.context,
+        docid: r.docid,
+        metadata: r.metadata,
+        explain: r.explain,
+      })), displayQuery, { ...opts, limit: results.length });
+    }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+  } catch (error) {
+    operationFailed = true;
+    throw error;
+  } finally {
+    try { await closeDbAsync(); }
+    catch (cleanupError) { if (!operationFailed) throw cleanupError; }
+  }
 }
 
 // Parse CLI arguments using util.parseArgs
@@ -3379,7 +3505,7 @@ function parseCLI() {
       "full-path": { type: "boolean" },  // show on-disk paths instead of qmd:// (get/multi-get/search/query)
       // Query options
       "candidate-limit": { type: "string", short: "C" },
-      "no-rerank": { type: "boolean", default: false },
+      "no-rerank": { type: "boolean" },
       "no-gpu": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
@@ -3450,7 +3576,7 @@ function parseCLI() {
     collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
-    skipRerank: !!values["no-rerank"],
+    skipRerank: values["no-rerank"] === true ? true : (values["no-rerank"] === false ? false : undefined),
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
@@ -4439,17 +4565,60 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
 }
 
 async function showDoctor(): Promise<void> {
-  const storeInstance = getStore();
+  const nextSteps: string[] = [];
+  const configCheck = checkDoctorIndexConfig(nextSteps);
+  if (!configCheck.valid) {
+    console.log(`${c.bold}QMD Doctor${c.reset}\n`);
+    console.log(`Index: ${getDbPath()}`);
+    const steps = normalizedDoctorNextSteps(nextSteps);
+    if (steps.length > 0) {
+      console.log(`\n${c.bold}Recommended next step${steps.length === 1 ? "" : "s"}${c.reset}`);
+      for (const step of steps) console.log(`  - ${step}`);
+    }
+    return;
+  }
+  const storeInstance = getStore(configCheck.config ?? undefined);
+  const capturedEmbed = capturedConfig?.models?.embed;
+  let metadataOnly = typeof capturedEmbed === "object" && capturedEmbed.backend === "onnx";
+  let operationFailed = false;
+  try {
+    // A stored new namespace without a selected ONNX config is inventory, not
+    // permission to run the default GGUF diagnostic/adoption pipeline.
+    const selected = metadataOnly ? await getVectorStore() : storeInstance;
+    const diagnostic = await inspectStoreEmbeddings(selected, false);
+    metadataOnly = metadataOnly || diagnostic.backend === "onnx" || diagnostic.storedIdentity !== undefined;
+    if (metadataOnly) {
+      console.log(`${c.bold}QMD Doctor${c.reset}\n`);
+      console.log(`Index: ${getDbPath()}`);
+      doctorCheck("embedding backend", true, `${diagnostic.backend.toUpperCase()}; metadata-only inspection`);
+      doctorCheck("embedding compatibility", diagnostic.compatible, diagnostic.reason);
+      console.log(`Embedding requested device: ${diagnostic.requestedDevice ?? "not selected"}`);
+      console.log(`Embedding initialized mode: ${diagnostic.initializedMode ?? "not initialized"}`);
+      console.log(`CPU retry reason: ${diagnostic.cpuRetryReason ?? "not reported"}`);
+      console.log("Graph node placement: unknown (not measured)");
+      console.log(`Stored identity (inventory only): ${diagnostic.storedIdentity ?? "not recorded"}`);
+      console.log(`Prepared producer identity: ${diagnostic.identity ?? "not established"}`);
+      console.log(`Sample verification: ${diagnostic.sampleVerification} (no model work requested)`);
+      return;
+    }
+  } catch (error) {
+    operationFailed = true;
+    throw error;
+  } finally {
+    if (metadataOnly || operationFailed) {
+      try { await closeDbAsync(); }
+      catch (cleanupError) { if (!operationFailed) throw cleanupError; }
+    }
+  }
   const db = storeInstance.db;
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
   const embedModel = activeModels.embed;
   const fingerprint = getEmbeddingFingerprint(embedModel);
-  const nextSteps: string[] = [];
 
   console.log(`${c.bold}QMD Doctor${c.reset}\n`);
   console.log(`Index: ${getDbPath()}`);
-  console.log(`Runtime: ${isBun ? "bun:sqlite" : "better-sqlite3"}`);
+  console.log(`Runtime: ${isBun ? "Bun" : "Node"} with better-sqlite3 driver`);
 
   try {
     const row = db.prepare(`SELECT sqlite_version() AS version`).get() as { version: string };
@@ -4468,7 +4637,6 @@ async function showDoctor(): Promise<void> {
     doctorCheck("sqlite-vec", false, error instanceof Error ? error.message : String(error));
   }
 
-  const configCheck = checkDoctorIndexConfig(nextSteps);
   const configModels = configCheck.config?.models ?? {};
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
@@ -4960,18 +5128,13 @@ if (isMain) {
 
     case "embed":
       try {
-        await resolveLocalConfigTrust();
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
         const embedMaxDurationMs = parseEmbedTimeoutOption(cli.values["timeout"]);
-        // Validate -c against configured collections before dispatching, so a
-        // typo errors with "Collection not found: X" instead of silently
-        // reporting success because no pending docs match a nonexistent name.
-        // embed operates on a single collection; only the first value is used.
-        const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
-        const embedCollection = embedValidatedCollections[0];
-        await vectorIndex(resolveModelsForRuntime().embed, !!cli.values.force, {
+        // The handler validates the first -c value against its captured config.
+        const embedCollection = cli.opts.collection?.[0];
+        await vectorIndex(!!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
@@ -5026,7 +5189,6 @@ if (isMain) {
         cli.opts.minScore = 0.3;
       }
       cli.opts.filter = parseCliMetadataFilter(cli.values.filter);
-      await resolveLocalConfigTrust();
       await vectorSearch(cli.query, cli.opts);
       break;
 
@@ -5037,7 +5199,6 @@ if (isMain) {
         process.exit(1);
       }
       cli.opts.filter = parseCliMetadataFilter(cli.values.filter);
-      await resolveLocalConfigTrust();
       await querySearch(cli.query, cli.opts);
       break;
 

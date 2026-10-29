@@ -1,14 +1,17 @@
+import { isBun } from "../../src/db.js";
 import { createStore } from "../../src/store.js";
 import { checkEmbeddingVectorSamples } from "../../src/cli/qmd.js";
 import { LlamaCpp, setDefaultLlamaCpp } from "../../src/llm.js";
-import { heapLimitBinds } from "./heap-limit.js";
+import { verifyHeapLimit } from "./heap-limit.js";
 
-// Every stored vector is [1, 0] and every re-embedded chunk returns [1, 0], so
-// the check passes whenever it can sample, read and chunk the bodies.
+// Every stored and reproduced vector is [1, 0], isolating sampling and chunking.
 class ConstantLlm extends LlamaCpp {
   override async tokenize(text: string) { return new Array(Math.ceil(text.length / 16)).fill(1); }
   override async embed() { return { embedding: [1, 0], model: "model" }; }
 }
+
+const strict = process.env.QMD_TEST_SQLITE_MEMORY_STRICT === "1";
+const budgetBytes = 33554432;
 
 const store = createStore(":memory:");
 try {
@@ -28,9 +31,12 @@ try {
     }
   })();
   store.db.exec("PRAGMA temp_store = MEMORY");
-  store.db.exec("PRAGMA hard_heap_limit = 33554432");
+  store.db.exec(`PRAGMA hard_heap_limit = ${budgetBytes}`);
+
+  const binds = verifyHeapLimit(store.db, budgetBytes, strict);
+
   const result = await checkEmbeddingVectorSamples(store.db, "model", "current");
-  console.log(JSON.stringify({ ...result, limitBinds: heapLimitBinds(store.db, 33554432) }));
+  console.log(JSON.stringify({ ...result, limitBinds: binds, runtime: isBun ? "bun" : "node", budgetBytes }));
 } finally {
   setDefaultLlamaCpp(null);
   store.close();

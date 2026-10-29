@@ -726,6 +726,7 @@ describe("CLI Status Command", () => {
   });
 
   test("qmd doctor reports core index health checks", async () => {
+    const configBefore = readFileSync(join(testConfigDir, "index.yml"), "utf-8");
     const { stdout, exitCode } = await runQmd(["doctor"]);
     expect(exitCode).toBe(0);
     expect(stdout).toContain("QMD Doctor");
@@ -746,10 +747,7 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("please run qmd embed again");
 
     const configText = readFileSync(join(testConfigDir, "index.yml"), "utf-8");
-    expect(configText).toContain("models:");
-    expect(configText).toContain(DEFAULT_EMBED_MODEL_URI);
-    expect(configText).toContain(DEFAULT_GENERATE_MODEL_URI);
-    expect(configText).toContain(DEFAULT_RERANK_MODEL_URI);
+    expect(configText).toBe(configBefore);
   }, 20000);
 
   test("qmd doctor warns when no collections are configured", async () => {

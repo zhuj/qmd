@@ -31,6 +31,7 @@ import {
   resolveCollectionId,
   resolveCollectionIds,
   rowidList,
+  storedEmbedding,
   storedEmbeddingLookup,
   upsertPartitionVector,
   vecInteger,
@@ -49,6 +50,7 @@ import {
 import type { Database, SQLiteValue } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
+import { isDeepStrictEqual } from "node:util";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
@@ -65,6 +67,15 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
+import { createEmbeddingCapability } from "./embeddings/factory.js";
+import type { EmbeddingCapability, EmbeddingIdentity, EmbeddingInput, ResolvedEmbeddingConfig } from "./embeddings/types.js";
+import { commitEmbeddingSpace, planEmbeddingAdmission, readEmbeddingSpace } from "./embeddings/space-store.js";
+import { createEmbeddingBudget } from "./embeddings/index-budget.js";
+import { assertEmbeddingQueryFits, chunkEmbeddingDocument } from "./embeddings/chunking.js";
+import { resolveSearchStagePolicy } from "./embeddings/config.js";
+import type { SearchStageRequest } from "./embeddings/types.js";
+import { validateEmbeddingVectors } from "./embeddings/recipe.js";
+import type { LegacyEmbeddingFormatting } from "./embeddings/gguf.js";
 import type {
   NamedCollection,
   Collection,
@@ -1587,12 +1598,18 @@ export type Store = {
   dbPath: string;
   /** Optional LlamaCpp instance for this store (overrides the global singleton) */
   llm?: LlamaCpp;
+  /** True only when this store, rather than a CLI/global owner, created the LlamaCpp instance. */
+  ownsLlm?: boolean;
+  /** Per-store embedding producer and immutable normalized selection. */
+  readonly embedding?: EmbeddingCapability;
+  readonly embeddingConfig?: ResolvedEmbeddingConfig;
   close: () => void;
+  closeAsync: () => Promise<void>;
   ensureVecTable: (dimensions: number) => void;
 
   // Index health
-  getHashesNeedingEmbedding: (model?: string) => number;
-  getIndexHealth: (model?: string) => IndexHealthInfo;
+  getHashesNeedingEmbedding: (model?: string, identity?: EmbeddingIdentity) => number;
+  getIndexHealth: (model?: string, identity?: EmbeddingIdentity) => IndexHealthInfo;
   getStatus: (model?: string) => IndexStatus;
   getStatusSummary: (model?: string) => IndexStatusSummary;
 
@@ -1625,7 +1642,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter, precomputedIdentity?: string) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -1658,6 +1675,160 @@ export type Store = {
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => void;
 };
+
+interface StoreLifecycle {
+  activeEmbeddingOperations: number;
+  closing: boolean;
+  databaseClosed: boolean;
+  closePromise?: Promise<void>;
+  drained?: () => void;
+  drainPromise?: Promise<void>;
+  preparedEmbeddingIdentity?: EmbeddingIdentity;
+}
+const storeLifecycles = new WeakMap<Store, StoreLifecycle>();
+
+function lifecycleFor(store: Store): StoreLifecycle {
+  const lifecycle = storeLifecycles.get(store);
+  if (lifecycle === undefined) throw new Error("Store lifecycle is not initialized");
+  return lifecycle;
+}
+
+function waitForEmbeddingOperations(lifecycle: StoreLifecycle): Promise<void> {
+  if (lifecycle.activeEmbeddingOperations === 0) return Promise.resolve();
+  return lifecycle.drainPromise ??= new Promise(resolve => { lifecycle.drained = resolve; });
+}
+
+function closeOwnedStore(store: Store): Promise<void> {
+  const lifecycle = lifecycleFor(store);
+  if (lifecycle.closePromise !== undefined) return lifecycle.closePromise;
+  lifecycle.closing = true;
+  lifecycle.closePromise = (async () => {
+    await waitForEmbeddingOperations(lifecycle);
+    let cleanupFailed = false;
+    if (store.embedding !== undefined) {
+      try { await store.embedding.close(); } catch { cleanupFailed = true; }
+    }
+    if (store.ownsLlm && store.llm !== undefined) {
+      try { await store.llm.dispose(); } catch { cleanupFailed = true; }
+    }
+    if (!lifecycle.databaseClosed) {
+      try { store.db.close(); lifecycle.databaseClosed = true; } catch { cleanupFailed = true; }
+    }
+    if (cleanupFailed) throw new Error("Store resource cleanup failed");
+  })();
+  return lifecycle.closePromise;
+}
+
+function closeStoreSynchronously(store: Store): void {
+  const lifecycle = lifecycleFor(store);
+  if (lifecycle.databaseClosed) return;
+  if (lifecycle.activeEmbeddingOperations > 0) {
+    throw new Error("Store has active embedding operations; use closeAsync() to wait for them");
+  }
+  if (store.ownsLlm || store.embedding !== undefined) throw new Error("Store owns asynchronous model resources; use closeAsync()");
+  if (lifecycle.closing) throw new Error("Store is already closing; use closeAsync()");
+  lifecycle.closing = true;
+  store.db.close();
+  lifecycle.databaseClosed = true;
+}
+
+function freezeEmbeddingConfig(config: ResolvedEmbeddingConfig): ResolvedEmbeddingConfig {
+  switch (config.backend) {
+    case "gguf": return Object.freeze({ backend: "gguf", model: config.model });
+    case "onnx":
+      return Object.freeze({ ...config, source: Object.freeze({ ...config.source }),
+        recipe: Object.freeze({ ...config.recipe,
+          ...(config.recipe.reduction === undefined ? {} : { reduction: Object.freeze({ ...config.recipe.reduction }) }),
+        }) });
+    default: {
+      const exhaustive: never = config;
+      throw new Error(`Unsupported embedding backend: ${exhaustive}`);
+    }
+  }
+}
+
+function sameEmbeddingConfig(left: ResolvedEmbeddingConfig, right: ResolvedEmbeddingConfig): boolean {
+  if (left.backend !== right.backend) return false;
+  switch (left.backend) {
+    case "gguf": return right.backend === "gguf" && left.model === right.model;
+    case "onnx":
+      return right.backend === "onnx"
+        && isDeepStrictEqual(left.source, right.source)
+        && isDeepStrictEqual(left.recipe, right.recipe)
+        && left.device === right.device && left.fallback === right.fallback && left.dtype === right.dtype
+        && left.dimensions === right.dimensions && left.allowDownload === right.allowDownload
+        && left.intraOpNumThreads === right.intraOpNumThreads && left.batchSize === right.batchSize
+        && left.maxBatchTokens === right.maxBatchTokens;
+    default: {
+      const exhaustive: never = left;
+      throw new Error(`Unsupported embedding backend: ${exhaustive}`);
+    }
+  }
+}
+
+export function configureStoreEmbeddings(
+  store: Store, config: ResolvedEmbeddingConfig, capability?: EmbeddingCapability,
+): void {
+  const lifecycle = lifecycleFor(store);
+  if (lifecycle.closing || lifecycle.databaseClosed) throw new Error("Cannot configure embeddings on a closing store");
+  if (store.embedding !== undefined || store.embeddingConfig !== undefined) {
+    throw new Error("Store embedding configuration is immutable once selected");
+  }
+  const snapshot = freezeEmbeddingConfig(config);
+  const formatting: LegacyEmbeddingFormatting = {
+    query: formatQueryForEmbedding,
+    document: formatDocForEmbedding,
+    fingerprint: getEmbeddingFingerprint,
+  };
+  const raw = capability ?? createEmbeddingCapability(snapshot, store.llm ?? getDefaultLlamaCpp(), formatting);
+  if (!sameEmbeddingConfig(snapshot, raw.config)) {
+    throw new Error("Embedding capability does not match the store's resolved configuration");
+  }
+  function track<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (lifecycle.closing) return Promise.reject(new Error("Store is closing"));
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    lifecycle.activeEmbeddingOperations++;
+    return Promise.resolve().then(operation).finally(() => {
+      lifecycle.activeEmbeddingOperations--;
+      if (lifecycle.activeEmbeddingOperations === 0) {
+        lifecycle.drained?.(); lifecycle.drained = undefined; lifecycle.drainPromise = undefined;
+      }
+    });
+  }
+  const measureTokens = raw.measureTokens;
+  let producerClose: Promise<void> | undefined;
+  const closeProducer = () => {
+    lifecycle.closing = true;
+    return producerClose ??= Promise.resolve().then(async () => {
+      await waitForEmbeddingOperations(lifecycle);
+      try { await raw.close(); } catch { throw new Error("Store embedding cleanup failed"); }
+    });
+  };
+  const tracked = Object.freeze({
+    config: snapshot,
+    modelLabel: raw.modelLabel,
+    get provenance() { return raw.provenance; },
+    prepare: (signal?: AbortSignal) => track(async () => {
+      const identity = await raw.prepare(signal);
+      signal?.throwIfAborted();
+      const copy = structuredClone(identity);
+      planEmbeddingAdmission({ kind: "empty" }, copy, { kind: "query" });
+      lifecycle.preparedEmbeddingIdentity = copy;
+      return identity;
+    }, signal),
+    encode: (text: string) => track(() => raw.encode(text)),
+    decode: (tokens: readonly number[]) => track(() => raw.decode(tokens)),
+    ...(measureTokens ? { measureTokens: (input: Parameters<typeof measureTokens>[0], signal?: AbortSignal) =>
+      track(() => measureTokens.call(raw, input, signal), signal) } : {}),
+    embed: (inputs: Parameters<EmbeddingCapability["embed"]>[0], signal?: AbortSignal) =>
+      track(() => raw.embed(inputs, signal), signal),
+    close: closeProducer,
+  });
+  Object.defineProperties(store, {
+    embeddingConfig: { value: snapshot, enumerable: true, writable: false, configurable: false },
+    embedding: { value: tracked, enumerable: true, writable: false, configurable: false },
+  });
+}
 
 // =============================================================================
 // Reindex & Embed — pure-logic functions for SDK and CLI
@@ -1910,8 +2081,23 @@ async function reindexCollectionIn(
   });
   // Filter hidden files/folders
   const files = allFiles.filter(file => {
-    const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
+    const resolvedFile = resolve(collectionPath, file);
+    const lexicalRel = getRelativePathFromPrefix(resolvedFile, resolve(collectionPath));
+    if (lexicalRel !== null) {
+      const parts = lexicalRel.split("/");
+      return !parts.some(part => part !== "." && part !== ".." && part.startsWith("."));
+    }
+    // Lexical classification failed (alias / symlink root / absolute naming physical path).
+    // Try canonical paths once; avoid per-file overhead for normal lexical-inside case.
+    const canonicalFile = getRealPath(resolvedFile);
+    const canonicalRoot = getRealPath(collectionPath);
+    const canonicalRel = getRelativePathFromPrefix(canonicalFile, canonicalRoot);
+    if (canonicalRel !== null) {
+      const parts = canonicalRel.split("/");
+      return !parts.some(part => part !== "." && part !== ".." && part.startsWith("."));
+    }
+    // Both lexical and canonical outside: preserve for OUTSIDE_COLLECTION reporting.
+    return true;
   });
 
   const total = files.length;
@@ -2127,6 +2313,7 @@ export type EmbedOptions = {
    * {@link DEFAULT_EMBED_MAX_DURATION_MS} (30 minutes).
    */
   maxDurationMs?: number;
+  signal?: AbortSignal;
   onProgress?: (info: EmbedProgress) => void;
 };
 
@@ -2240,8 +2427,37 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
-function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
+function getPendingEmbeddingDocs(db: Database, collection?: string, model: string | EmbeddingIdentity = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
+  if (typeof model !== "string") {
+    const identity = model;
+    const fp = identity.kind === "onnx-v1" ? identity.id : identity.fingerprint;
+    const label = identity.kind === "legacy-gguf" ? identity.model : null;
+    return withLazyContentVectorMigration(db, () => {
+      const stmt = db.prepare(`
+        SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
+        FROM documents d
+        JOIN content c ON d.hash = c.hash
+        LEFT JOIN (
+          SELECT hash, model, COUNT(*) AS chunk_count, MIN(seq) AS first_seq, MAX(seq) AS last_seq,
+            MIN(total_chunks) AS minimum_chunks, MAX(total_chunks) AS expected_chunks
+          FROM content_vectors
+          WHERE embed_fingerprint = ? AND (? IS NULL OR model = ?)
+          GROUP BY hash
+        ) v ON d.hash = v.hash
+        WHERE d.active = 1
+          AND (v.hash IS NULL OR v.expected_chunks < 1 OR v.chunk_count != v.expected_chunks
+            OR v.minimum_chunks != v.expected_chunks OR v.first_seq != 0 OR v.last_seq != v.expected_chunks - 1)
+          ${collectionFilter}
+        GROUP BY d.hash
+        ORDER BY MIN(d.path)
+      `);
+      const results: PendingEmbeddingDoc[] = [];
+      const iter = collection ? stmt.iterate<PendingEmbeddingDoc>(fp, label, label, collection) : stmt.iterate<PendingEmbeddingDoc>(fp, label, label);
+      for (const row of iter) results.push(row);
+      return results;
+    });
+  }
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
@@ -2327,44 +2543,82 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
 
 /**
  * Generate vector embeddings for documents that need them.
- * Pure function — no console output, no db lifecycle management.
- * Uses the store's LlamaCpp instance if set, otherwise the global singleton.
+ * Uses one preflighted capability, with per-batch atomic persistence.
+ * Owns an operation lease/deadline, not the store's database or configured model.
  */
 export async function generateEmbeddings(
   store: Store,
-  options?: EmbedOptions
+  requestedOptions?: EmbedOptions
 ): Promise<EmbedResult> {
   const db = store.db;
-  const llm = getLlm(store);
-  const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
-  const fingerprint = getEmbeddingFingerprint(model);
-  const now = new Date().toISOString();
-  const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
-  const encoder = new TextEncoder();
+  const lifecycle = lifecycleFor(store);
+  if (lifecycle.closing) throw new Error("Store is closing");
+  const budget = createEmbeddingBudget(requestedOptions?.signal, requestedOptions?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS);
+  const options: EmbedOptions = { ...requestedOptions, signal: budget.signal };
+  lifecycle.activeEmbeddingOperations++;
+  let ephemeralCap: EmbeddingCapability | undefined;
+  let operationFailed = false;
+  let partialResult: (() => EmbedResult) | undefined;
+  try {
+    options?.signal?.throwIfAborted();
+    if (!options.force && !db.prepare("SELECT 1 FROM documents WHERE active=1 LIMIT 1").get()) {
+      return { docsProcessed: 0, chunksEmbedded: 0, chunksCopied: 0, errors: 0, durationMs: 0, failures: [] };
+    }
+    let identity: EmbeddingIdentity;
+    let cap: EmbeddingCapability;
+    if (store.embedding) {
+      if (options?.model !== undefined && options.model !== store.embedding.modelLabel) {
+        throw new Error("Per-call model override does not match the selected embedding producer");
+      }
+      identity = await store.embedding.prepare(options?.signal);
+      options?.signal?.throwIfAborted();
+      planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "embed", force: options?.force, collection: options?.collection });
+      cap = store.embedding;
+    } else {
+      const llm = getLlm(store);
+      const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
+      const formatting: LegacyEmbeddingFormatting = {
+        query: formatQueryForEmbedding,
+        document: formatDocForEmbedding,
+        fingerprint: getEmbeddingFingerprint,
+      };
+      ephemeralCap = createEmbeddingCapability({ backend: "gguf", model }, llm, formatting);
+      identity = await ephemeralCap.prepare(options?.signal);
+      options?.signal?.throwIfAborted();
+      planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "embed", force: options?.force, collection: options?.collection });
+      cap = ephemeralCap;
+    }
 
-  if (options?.force) {
-    clearAllEmbeddings(db, options?.collection);
-  }
+    const now = new Date().toISOString();
+    const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
+    const encoder = new TextEncoder();
 
-  const chunksCopied = copyVectorsToNewCollections(db, options?.collection).copied;
-  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
+    if (options?.force) {
+      db.transaction(() => {
+        options?.signal?.throwIfAborted();
+        planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "embed", force: true, collection: options?.collection });
+        clearAllEmbeddings(db, options?.collection);
+      }).immediate();
+      planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "embed", force: false, collection: options?.collection });
+    }
 
-  if (docsToEmbed.length === 0) {
-    return { docsProcessed: 0, chunksEmbedded: 0, chunksCopied, errors: 0, durationMs: 0 };
-  }
-  const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
-  const totalDocs = docsToEmbed.length;
-  const startTime = Date.now();
+    const chunksCopied = copyVectorsToNewCollections(db, options?.collection, identity).copied;
+    const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, identity);
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
-  const embedModelUri = model;
+    if (docsToEmbed.length === 0) {
+      return { docsProcessed: 0, chunksEmbedded: 0, chunksCopied, errors: 0, durationMs: 0, failures: [] };
+    }
+    const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+    const totalDocs = docsToEmbed.length;
+    const startTime = Date.now();
 
-  // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
+    const modelLabel = cap.modelLabel;
+    const fingerprint = identity.kind === "onnx-v1" ? identity.id : identity.fingerprint;
+    const dimensions = identity.kind === "onnx-v1" ? identity.descriptor.dimensions : identity.dimensions;
+
     let chunksEmbedded = 0;
     let bytesProcessed = 0;
     let totalChunks = 0;
-    let vectorTableInitialized = false;
     const BATCH_SIZE = 32;
     const RETRY_AFTER_SUCCESSFUL_CHUNKS = 64;
     const MAX_RETRY_ATTEMPTS = 3;
@@ -2374,6 +2628,12 @@ export async function generateEmbeddings(
 
     const failureList = () => [...failures.values()];
     const activeErrorCount = () => failures.size;
+    const expectedForOperation = new Map<string, number>();
+    partialResult = () => {
+      const removed = expectedForOperation.size ? removeIncompleteEmbeddings(db, expectedForOperation, identity) : 0;
+      return { docsProcessed: totalDocs, chunksEmbedded: Math.max(0, chunksEmbedded - removed), chunksCopied,
+        errors: activeErrorCount(), failures: failureList(), durationMs: Date.now() - startTime };
+    };
     const chunkKey = (chunk: ChunkItem) => `${chunk.hash}:${chunk.seq}`;
     const reasonFromError = (error: unknown) => {
       const raw = error instanceof Error ? error.message : String(error);
@@ -2396,33 +2656,51 @@ export async function generateEmbeddings(
       failures.delete(key);
       retryQueue.delete(key);
     };
-    const tryEmbedChunk = async (chunk: ChunkItem): Promise<boolean> => {
-      try {
-        const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
-        const result = await session.embed(text, { model });
-        if (!result) {
-          recordFailure(chunk, "embedding returned no vector");
-          return false;
+
+    const resetHashes = new Set<string>();
+    const persistBatch = (chunks: readonly ChunkItem[], vectors: readonly Float32Array[]) => {
+      validateEmbeddingVectors(vectors, chunks.length, dimensions, dimensions);
+      options?.signal?.throwIfAborted();
+      const firstWrites = [...new Set(chunks.map(chunk => chunk.hash))].filter(hash => !resetHashes.has(hash));
+      db.transaction(() => {
+        options?.signal?.throwIfAborted();
+        const admission = planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "embed", collection: options?.collection });
+        commitEmbeddingSpace(db, admission, cap.provenance);
+        store.ensureVecTable(dimensions);
+        for (const hash of firstWrites) {
+          deletePartitionRowsOfHash(db, hash);
+          db.prepare("DELETE FROM content_vectors WHERE hash=? AND embed_fingerprint=?").run(hash, fingerprint);
         }
-        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
-        chunksEmbedded++;
-        successesSinceRetry++;
-        clearFailure(chunk);
-        return true;
+        for (const [index, chunk] of chunks.entries()) {
+          const vector = vectors[index];
+          if (!vector) throw new Error("Embedding batch cardinality changed before persistence");
+          insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, vector, modelLabel, now, chunk.expectedTotalChunks, fingerprint);
+        }
+        options?.signal?.throwIfAborted();
+      }).immediate();
+      for (const hash of firstWrites) resetHashes.add(hash);
+    };
+
+    const tryEmbedChunk = async (chunk: ChunkItem): Promise<boolean> => {
+      let results: readonly Float32Array[];
+      try {
+        const input: EmbeddingInput = { kind: "document", text: chunk.text, title: chunk.title };
+        results = await cap.embed([input], options?.signal);
+        options?.signal?.throwIfAborted();
       } catch (error) {
+        options?.signal?.throwIfAborted();
         recordFailure(chunk, reasonFromError(error));
         return false;
       }
+      persistBatch([chunk], results);
+      chunksEmbedded++; successesSinceRetry++; clearFailure(chunk);
+      return true;
     };
+
     const retryFailedChunks = async (force = false) => {
-      if (!session.isValid || retryQueue.size === 0) return;
+      if (retryQueue.size === 0) return;
       if (!force && successesSinceRetry < RETRY_AFTER_SUCCESSFUL_CHUNKS) return;
       successesSinceRetry = 0;
-
-      // Normal mode: one retry pass after enough unrelated chunks succeeded.
-      // Force mode: we have run out of other chunks for this batch, so keep
-      // retrying outstanding failures until they recover or hit the cap. The
-      // cap prevents endless loops on permanently bad chunks.
       do {
         let retried = 0;
         for (const [key, chunk] of [...retryQueue]) {
@@ -2432,20 +2710,17 @@ export async function generateEmbeddings(
           await tryEmbedChunk(chunk);
         }
         if (!force || retried === 0) break;
-      } while (session.isValid && [...retryQueue].some(([key]) => {
+      } while ([...retryQueue].some(([key]) => {
         const failure = failures.get(key);
         return !!failure && failure.attempts < MAX_RETRY_ATTEMPTS;
       }));
     };
+
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
+    const llmForLegacy = cap.config.backend === "gguf" ? getLlm(store) : undefined;
 
     for (const batchMeta of batches) {
-      // Abort early if session has been invalidated
-      if (!session.isValid) {
-        console.warn(`⚠ Session expired — skipping remaining document batches`);
-        break;
-      }
-
+      options?.signal?.throwIfAborted();
       const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
       const batchChunks: ChunkItem[] = [];
       const expectedChunksByHash = new Map<string, number>();
@@ -2453,31 +2728,54 @@ export async function generateEmbeddings(
 
       for (const doc of batchDocs) {
         if (!doc.body.trim()) continue;
-
         const title = extractTitle(doc.body, doc.path);
-        const chunks = await chunkDocumentByTokensWithLlm(
-          llm,
-          doc.body,
-          undefined, undefined, undefined,
-          doc.path,
-          options?.chunkStrategy,
-          session.signal,
-        );
-
-        for (let seq = 0; seq < chunks.length; seq++) {
-          batchChunks.push({
-            hash: doc.hash,
-            path: doc.path,
+        if (cap.config.backend === "onnx") {
+          const adapter = (text: string, maxChars: number) => chunkDocumentAsync(text, maxChars, 0, undefined, doc.path, options?.chunkStrategy);
+          const chunks = await chunkEmbeddingDocument(
+            cap,
+            cap.config.recipe,
+            doc.body,
             title,
-            text: chunks[seq]!.text,
-            seq,
-            pos: chunks[seq]!.pos,
-            tokens: chunks[seq]!.tokens,
-            bytes: encoder.encode(chunks[seq]!.text).length,
-            expectedTotalChunks: chunks.length,
-          });
+            adapter,
+            options?.signal,
+          );
+          for (const [seq, ch] of chunks.entries()) {
+            batchChunks.push({
+              hash: doc.hash,
+              path: doc.path,
+              title,
+              text: ch.text,
+              seq,
+              pos: ch.pos,
+              tokens: ch.tokens,
+              bytes: encoder.encode(ch.text).length,
+              expectedTotalChunks: chunks.length,
+            });
+          }
+          expectedChunksByHash.set(doc.hash, chunks.length);
+          expectedForOperation.set(doc.hash, chunks.length);
+        } else if (llmForLegacy) {
+          const chunks = await withLLMSessionForLlm(llmForLegacy, async (session) => {
+            return chunkDocumentByTokensWithLlm(llmForLegacy, doc.body, undefined, undefined, undefined, doc.path, options?.chunkStrategy, session.signal);
+          }, { maxDuration: 0, name: 'chunkLegacy', signal: options.signal });
+          if (Array.isArray(chunks)) {
+            for (const [seq, ch] of chunks.entries()) {
+              batchChunks.push({
+                hash: doc.hash,
+                path: doc.path,
+                title,
+                text: ch.text,
+                seq,
+                pos: ch.pos,
+                tokens: ch.tokens,
+                bytes: encoder.encode(ch.text).length,
+                expectedTotalChunks: chunks.length,
+              });
+            }
+            expectedChunksByHash.set(doc.hash, chunks.length);
+            expectedForOperation.set(doc.hash, chunks.length);
+          }
         }
-        expectedChunksByHash.set(doc.hash, chunks.length);
       }
 
       totalChunks += batchChunks.length;
@@ -2488,84 +2786,40 @@ export async function generateEmbeddings(
         continue;
       }
 
-      if (!vectorTableInitialized) {
-        const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
-        const firstResult = await session.embed(firstText, { model });
-        if (!firstResult) {
-          throw new Error("Failed to get embedding dimensions from first chunk");
-        }
-        store.ensureVecTable(firstResult.embedding.length);
-        vectorTableInitialized = true;
-      }
-
       const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
       let batchChunkBytesProcessed = 0;
 
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
-        // Abort early if session has been invalidated (e.g. max duration exceeded)
-        if (!session.isValid) {
-          const remainingChunks = batchChunks.slice(batchStart);
-          for (const chunk of remainingChunks) recordFailure(chunk, "LLM session expired before embedding chunk");
-          console.warn(`⚠ Session expired — skipping ${remainingChunks.length} remaining chunks`);
-          break;
-        }
+        options?.signal?.throwIfAborted();
 
-        // Abort early if active error rate is too high (>80% of attempted chunks failed)
         const processed = chunksEmbedded + activeErrorCount();
         if (processed >= BATCH_SIZE && activeErrorCount() > processed * 0.8) {
           const remainingChunks = batchChunks.slice(batchStart);
           for (const chunk of remainingChunks) recordFailure(chunk, "embedding aborted because error rate was too high");
-          console.warn(`⚠ Error rate too high (${activeErrorCount()}/${processed}) — aborting embedding`);
           break;
         }
 
         const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
         const chunkBatch = batchChunks.slice(batchStart, batchEnd);
-        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
+        const inputs: EmbeddingInput[] = chunkBatch.map(chunk => ({ kind: "document", text: chunk.text, title: chunk.title }));
 
+        let embeddings: readonly Float32Array[] | undefined;
         try {
-          const embeddings = await session.embedBatch(texts, { model });
-          // One IMMEDIATE transaction per batch: every chunk writes several
-          // rows across three tables, and a kill mid-batch must not leave
-          // them out of step. Failure bookkeeping runs after the commit.
-          const stored: ChunkItem[] = [];
-          const unembedded: ChunkItem[] = [];
-          db.transaction(() => {
-            for (let i = 0; i < chunkBatch.length; i++) {
-              const chunk = chunkBatch[i]!;
-              const embedding = embeddings[i];
-              if (embedding) {
-                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
-                stored.push(chunk);
-              } else {
-                unembedded.push(chunk);
-              }
-            }
-          }).immediate();
-          for (const chunk of stored) {
-            chunksEmbedded++;
-            successesSinceRetry++;
-            clearFailure(chunk);
+          embeddings = await cap.embed(inputs, options?.signal);
+        } catch (error) {
+          options?.signal?.throwIfAborted();
+          for (const chunk of chunkBatch) {
+            await tryEmbedChunk(chunk);
+            batchChunkBytesProcessed += chunk.bytes;
+            await retryFailedChunks();
           }
-          for (const chunk of unembedded) recordFailure(chunk, "batch embedding returned no vector");
+        }
+        if (embeddings !== undefined) {
+          persistBatch(chunkBatch, embeddings);
+          chunksEmbedded += chunkBatch.length; successesSinceRetry += chunkBatch.length;
+          for (const chunk of chunkBatch) clearFailure(chunk);
           batchChunkBytesProcessed += chunkBatch.reduce((sum, chunk) => sum + chunk.bytes, 0);
           await retryFailedChunks();
-        } catch (error) {
-          // Batch failed — try individual embeddings as fallback. If an
-          // individual retry succeeds, any prior failure for that chunk is
-          // cleared, so the visible error count reflects outstanding failures.
-          const batchReason = reasonFromError(error);
-          if (!session.isValid) {
-            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
-            batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
-          } else {
-            for (const chunk of chunkBatch) {
-              await tryEmbedChunk(chunk);
-              batchChunkBytesProcessed += chunk.bytes;
-              await retryFailedChunks();
-            }
-          }
         }
 
         const proportionalBytes = totalBatchChunkBytes === 0
@@ -2583,26 +2837,40 @@ export async function generateEmbeddings(
 
       await retryFailedChunks(true);
 
-      const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
-      if (removedPartialChunks > 0) {
-        chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
-      }
+      options?.signal?.throwIfAborted();
+      const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, identity);
+      chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
 
       bytesProcessed += batchBytes;
       options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors: activeErrorCount(), failures: failureList() });
     }
 
-    return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
-
-  return {
-    docsProcessed: totalDocs,
-    chunksEmbedded: result.chunksEmbedded,
-    chunksCopied,
-    errors: result.errors,
-    failures: result.failures,
-    durationMs: Date.now() - startTime,
-  };
+    const result = { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
+    return {
+      docsProcessed: totalDocs,
+      chunksEmbedded: result.chunksEmbedded,
+      chunksCopied,
+      errors: result.errors,
+      failures: result.failures,
+      durationMs: Date.now() - startTime,
+    };
+  } catch (error) {
+    operationFailed = true;
+    if (budget.expired() && !requestedOptions?.signal?.aborted && partialResult) return partialResult();
+    throw error;
+  } finally {
+    budget.close();
+    try {
+      await ephemeralCap?.close();
+    } catch {
+      if (!operationFailed) throw new Error("Embedding operation cleanup failed");
+    } finally {
+      lifecycle.activeEmbeddingOperations--;
+      if (lifecycle.activeEmbeddingOperations === 0) {
+        lifecycle.drained?.(); lifecycle.drained = undefined; lifecycle.drainPromise = undefined;
+      }
+    }
+  }
 }
 
 /**
@@ -2620,12 +2888,16 @@ export function createStore(dbPath?: string): Store {
   const store: Store = {
     db,
     dbPath: resolvedPath,
-    close: () => db.close(),
+    close: () => closeStoreSynchronously(store),
+    closeAsync: () => closeOwnedStore(store),
     ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
 
     // Index health
-    getHashesNeedingEmbedding: (model?: string) => getHashesNeedingEmbedding(db, undefined, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
-    getIndexHealth: (model?: string) => getIndexHealth(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
+    getHashesNeedingEmbedding: (model?: string, identity?: EmbeddingIdentity) => {
+      const id = identityForStoreHealth(store, identity);
+      return id ? getHashesNeedingEmbeddingInSpace(db, id) : getHashesNeedingEmbedding(db, undefined, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL);
+    },
+    getIndexHealth: (model?: string, identity?: EmbeddingIdentity) => getIndexHealth(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL, identityForStoreHealth(store, identity)),
     getStatus: (model?: string) => getStatus(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
     getStatusSummary: (model?: string) => getStatusSummary(db, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
 
@@ -2658,12 +2930,18 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => searchFTS(db, query, limit, collectionName, filter),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), filter),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter, precomputedIdentity?: string) => withStoreQueryLease(store, () =>
+      searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, store.embedding ? undefined : getLlm(store), filter,
+        store.embedding ? { capability: store.embedding, precomputedIdentity } : undefined)),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
+    expandQuery: async (query: string, model?: string) => {
+      storeSearchStagePolicy(store, { expand: true });
+      return expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm);
+    },
     invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
+    rerank: async (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
+      storeSearchStagePolicy(store, { rerank: true });
       // Cache keys must use the resolved rerank model (store.llm or the global
       // singleton from models.rerank). Falling back to DEFAULT_RERANK_MODEL when
       // store.llm is unset made keys stable across config swaps (#764).
@@ -2697,6 +2975,7 @@ export function createStore(dbPath?: string): Store {
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, totalChunks, fingerprint),
   };
 
+  storeLifecycles.set(store, { activeEmbeddingOperations: 0, closing: false, databaseClosed: false });
   return store;
 }
 
@@ -2975,6 +3254,24 @@ export function getHashesNeedingEmbedding(db: Database, collection?: string, mod
   });
 }
 
+export function getHashesNeedingEmbeddingInSpace(db: Database, identity: EmbeddingIdentity, collection?: string): number {
+  planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "query" });
+  const fingerprint = identity.kind === "onnx-v1" ? identity.id : identity.fingerprint;
+  const label = identity.kind === "legacy-gguf" ? identity.model : null;
+  return withLazyContentVectorMigration(db, () => {
+    const statement = db.prepare(`SELECT COUNT(DISTINCT d.hash) AS count FROM documents d
+      LEFT JOIN (SELECT hash, COUNT(*) AS chunk_count, MIN(seq) AS first_seq, MAX(seq) AS last_seq,
+        MIN(total_chunks) AS minimum_chunks, MAX(total_chunks) AS expected_chunks FROM content_vectors
+        WHERE embed_fingerprint=? AND (? IS NULL OR model=?) GROUP BY hash) v ON d.hash=v.hash
+      WHERE d.active=1 AND (v.hash IS NULL OR v.expected_chunks < 1 OR v.chunk_count != v.expected_chunks
+        OR v.minimum_chunks != v.expected_chunks OR v.first_seq != 0 OR v.last_seq != v.expected_chunks-1) ${collection ? "AND d.collection=?" : ""}`);
+    const row = collection ? statement.get<{ count: number }>(fingerprint, label, label, collection)
+      : statement.get<{ count: number }>(fingerprint, label, label);
+    if (!row) throw new Error("Embedding completeness count is unavailable");
+    return row.count;
+  });
+}
+
 export type IndexHealthInfo = {
   needsEmbedding: number;
   totalDocs: number;
@@ -2987,7 +3284,146 @@ export type LegacyFingerprintAdoptionResult = {
   reason: string;
 };
 
+export class EmbeddingCompatibilityUnverifiedError extends Error {
+  constructor(message = "Embedding producer compatibility is unverified; prepare the selected producer before requesting producer-relative health") {
+    super(message);
+    this.name = "EmbeddingCompatibilityUnverifiedError";
+  }
+}
+
+export interface StoreEmbeddingDiagnostics {
+  backend: "gguf" | "onnx";
+  identity: string | undefined;
+  storedIdentity?: string;
+  compatible: boolean;
+  reason: string;
+  requestedDevice?: string;
+  initializedMode?: string;
+  cpuRetryReason?: string;
+  graphNodePlacement: "unknown";
+  sampleVerification: "not-run" | "unavailable" | "exact-reproduction-observed" | "exact-reproduction-not-observed" | "failed";
+  sampleReason?: string;
+}
+
+const EMBEDDING_DIAGNOSTIC_UNVERIFIED = "Compatibility unverified: current producer identity has not been established; check the selected artifacts and configuration. Use a separate database for a different embedding configuration.";
+const EMBEDDING_DIAGNOSTIC_CONFLICT = "Embedding namespace is incompatible or ambiguous; use a separate database for a different embedding configuration.";
+
+function hasNewEmbeddingMetadata(db: Database): boolean {
+  if (db.prepare("SELECT 1 FROM store_config WHERE key IN ('embedding_space_v1','embedding_runtime_v1') LIMIT 1").get()) return true;
+  // Older identified GGUF layouts may still need their lazy column migration.
+  const columns = db.prepare("PRAGMA table_info(content_vectors)").all<{ name: string }>();
+  return columns.some(column => column.name === "embed_fingerprint")
+    && !!db.prepare("SELECT 1 FROM content_vectors WHERE embed_fingerprint LIKE 'onnx-v1:%' LIMIT 1").get();
+}
+
+/** Metadata is namespace inventory, not proof of the current artifact bytes.
+ * Explicit sample verification holds the store lease through its final reads. */
+export function inspectStoreEmbeddings(store: Store, verifySamples = false): Promise<StoreEmbeddingDiagnostics> {
+  return withStoreQueryLease(store, () => inspectEmbeddingProducer(store, verifySamples));
+}
+
+async function inspectEmbeddingProducer(store: Store, verifySamples: boolean): Promise<StoreEmbeddingDiagnostics> {
+  const current = readEmbeddingSpace(store.db);
+  const cap = store.embedding;
+  const config = store.embeddingConfig;
+  const newMetadata = current.kind === "onnx-v1" || hasNewEmbeddingMetadata(store.db);
+  const result: StoreEmbeddingDiagnostics = {
+    backend: config?.backend ?? (newMetadata ? "onnx" : "gguf"),
+    identity: undefined, storedIdentity: current.kind === "onnx-v1" ? current.identity.id : undefined,
+    compatible: false, reason: EMBEDDING_DIAGNOSTIC_UNVERIFIED,
+    requestedDevice: config?.backend === "onnx" ? config.device : undefined,
+    graphNodePlacement: "unknown", sampleVerification: "not-run",
+  };
+  const report = (): StoreEmbeddingDiagnostics => {
+    const live = cap?.provenance;
+    return { ...result, initializedMode: live?.initializedMode,
+      cpuRetryReason: live?.cpuRetryReason === undefined ? undefined
+        : live.cpuRetryReason === "provider-initialization-failed" ? live.cpuRetryReason : "cpu-retry-reported",
+    };
+  };
+  if ((current.kind === "ambiguous" && (newMetadata || config?.backend === "onnx"))
+    || (current.kind === "legacy-gguf" && config?.backend === "onnx")
+    || (current.kind === "onnx-v1" && config?.backend === "gguf")) {
+    result.reason = EMBEDDING_DIAGNOSTIC_CONFLICT;
+    return report();
+  }
+  let identity = lifecycleFor(store).preparedEmbeddingIdentity;
+  if (verifySamples && cap) {
+    try { await cap.prepare(); identity = lifecycleFor(store).preparedEmbeddingIdentity; }
+    catch {
+      result.sampleVerification = "failed";
+      result.sampleReason = "Selected producer preparation failed; verify its artifacts and configuration.";
+      return report();
+    }
+  }
+  if (identity === undefined) return report();
+  result.identity = identity.kind === "onnx-v1" ? identity.id : identity.fingerprint;
+  try { planEmbeddingAdmission(readEmbeddingSpace(store.db), identity, { kind: "query" }); }
+  catch { result.reason = EMBEDDING_DIAGNOSTIC_CONFLICT; return report(); }
+  result.compatible = true;
+  result.reason = "Prepared producer identity admitted to the stored namespace; this inspection does not re-read artifact bytes.";
+  if (!verifySamples) return report();
+  if (!cap || config?.backend !== "onnx" || identity.kind !== "onnx-v1") {
+    result.sampleVerification = "unavailable";
+    result.sampleReason = "Selected ONNX sample verification is unavailable; legacy GGUF diagnostics remain separate.";
+    return report();
+  }
+  try {
+    const samples = store.db.prepare(`
+      WITH sampled AS MATERIALIZED (
+        SELECT cv.hash,cv.seq,cv.pos FROM content_vectors cv
+        WHERE cv.embed_fingerprint=? AND EXISTS (SELECT 1 FROM documents d WHERE d.hash=cv.hash AND d.active=1)
+        ORDER BY cv.hash,cv.seq LIMIT 3
+      ) SELECT sampled.hash,sampled.seq,sampled.pos,c.doc AS body,
+        (SELECT MIN(d.path) FROM documents d WHERE d.hash=sampled.hash AND d.active=1) AS path
+      FROM sampled JOIN content c ON c.hash=sampled.hash
+    `).all<EmbeddingVectorSample>(identity.id);
+    let exact = true;
+    const dimensions = identity.descriptor.dimensions;
+    for (const sample of samples) {
+      const title = extractTitle(sample.body, sample.path);
+      const chunks = await chunkEmbeddingDocument(cap, config.recipe, sample.body, title,
+        (text, maxChars) => chunkDocumentAsync(text, maxChars, 0, undefined, sample.path));
+      const chunk = chunks.find(candidate => candidate.pos === sample.pos);
+      if (!chunk) { exact = false; continue; }
+      const vectors = await cap.embed([{ kind: "document", text: chunk.text, title }]);
+      validateEmbeddingVectors(vectors, 1, dimensions, dimensions);
+      const vector = vectors[0];
+      const bytes = storedEmbedding(store.db, sample.hash, sample.seq);
+      if (!vector || !bytes || bytes.byteLength !== dimensions * Float32Array.BYTES_PER_ELEMENT) {
+        throw new Error("Stored sample vector has invalid dimensions");
+      }
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const stored = Float32Array.from({ length: dimensions }, (_, index) => view.getFloat32(index * 4, true));
+      validateEmbeddingVectors([stored], 1, dimensions, dimensions);
+      if (!vector.every((value, index) => Object.is(value, stored[index]))) exact = false;
+    }
+    result.sampleVerification = samples.length === 0 ? "unavailable"
+      : exact ? "exact-reproduction-observed" : "exact-reproduction-not-observed";
+    result.sampleReason = samples.length === 0 ? "No current stored passages are available for sampling."
+      : "Exact float32 reproduction is a conservative observation, not a semantic-identity or provider-parity assessment.";
+  } catch {
+    result.sampleVerification = "failed";
+    result.sampleReason = "Sample verification failed; check the selected producer output and stored passage/vector integrity.";
+  }
+  // A producer operation can yield while another operation changes the namespace.
+  try { planEmbeddingAdmission(readEmbeddingSpace(store.db), identity, { kind: "query" }); }
+  catch {
+    result.compatible = false;
+    result.reason = EMBEDDING_DIAGNOSTIC_CONFLICT;
+    result.sampleVerification = "failed";
+    result.sampleReason = "Embedding namespace changed during sample verification.";
+  }
+  return report();
+}
+
 export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
+  if (store.embeddingConfig?.backend === "onnx") {
+    return { checked: false, adopted: 0, reason: "ONNX embedding spaces cannot adopt legacy fingerprints; use a separate database for a different embedding space" };
+  }
+  if (hasNewEmbeddingMetadata(store.db)) {
+    return { checked: false, adopted: 0, reason: "New or ambiguous embedding metadata cannot adopt legacy fingerprints; use a separate database for a different embedding space" };
+  }
   const db = store.db;
   const fingerprint = getEmbeddingFingerprint(model);
   const legacyCount = withLazyContentVectorMigration(db, () => {
@@ -3087,8 +3523,12 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
   });
 }
 
-export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexHealthInfo {
-  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model);
+export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL, identity?: EmbeddingIdentity): IndexHealthInfo {
+  if (identity === undefined) {
+    const space = readEmbeddingSpace(db);
+    if (space.kind === "onnx-v1" || hasNewEmbeddingMetadata(db)) throw new EmbeddingCompatibilityUnverifiedError();
+  }
+  const needsEmbedding = identity ? getHashesNeedingEmbeddingInSpace(db, identity) : getHashesNeedingEmbedding(db, undefined, model);
   const totalDocs = (db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number }).count;
 
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
@@ -3099,6 +3539,16 @@ export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL
   }
 
   return { needsEmbedding, totalDocs, daysStale };
+}
+
+function identityForStoreHealth(store: Store, explicit?: EmbeddingIdentity): EmbeddingIdentity | undefined {
+  if (explicit !== undefined) return explicit;
+  if (store.embeddingConfig?.backend === "onnx") {
+    const cached = lifecycleFor(store).preparedEmbeddingIdentity;
+    if (cached === undefined) throw new EmbeddingCompatibilityUnverifiedError();
+    return cached;
+  }
+  return undefined;
 }
 
 // =============================================================================
@@ -3214,7 +3664,7 @@ export function countOrphanedVectors(db: Database): number {
  * all. Returns the number of orphaned chunks deleted.
  */
 export function cleanupOrphanedVectors(db: Database): number {
-  // sqlite-vec may not be loaded (e.g. Bun's bun:sqlite lacks loadExtension).
+  // sqlite-vec may not be loaded when its native extension is unavailable.
   // The vec0 table can appear in sqlite_master from a prior session, but
   // querying it without the module loaded would crash (#380).
   if (!isSqliteVecAvailable()) {
@@ -4872,39 +5322,46 @@ function knnVecScanner(db: Database, partitioned: boolean, filter?: MetadataFilt
   };
 }
 
+/** Keep metadata eligibility document-scoped instead of re-evaluating it for every vector chunk. */
+function eligibleDocumentIdsSql(filter: MetadataFilter): { sql: string; params: SQLiteValue[] } {
+  const current = compileCurrentMetadataFilter(filter);
+  return {
+    sql: `SELECT d.id FROM documents d JOIN document_metadata dm ON dm.document_id = d.id WHERE d.active = 1 AND ${current.sql}`,
+    params: current.params,
+  };
+}
+
 /**
  * FROM and WHERE clauses selecting, as `vr`, the vector rows of active
  * documents a metadata filter admits. A row is eligible when any document of
  * its collection that holds the row's content passes the filter.
  */
 function metadataEligibleRowsSql(filter: MetadataFilter): { sql: string; params: SQLiteValue[] } {
-  const current = compileCurrentMetadataFilter(filter);
+  const docIds = eligibleDocumentIdsSql(filter);
   return {
     sql: `
-      FROM documents d
-      JOIN document_metadata dm ON dm.document_id = d.id
-      JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.name = d.collection
-      JOIN ${VEC_ROWS_TABLE} vr ON vr.hash = d.hash AND vr.collection_id = ci.id
-      WHERE d.active = 1 AND ${current.sql}`,
-    params: current.params,
+      FROM ${VEC_ROWS_TABLE} vr
+      JOIN documents d ON d.hash = vr.hash
+      JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.name = d.collection AND ci.id = vr.collection_id
+      WHERE d.id IN (${docIds.sql})`,
+    params: docIds.params,
   };
 }
 
 /**
  * Ids of the collections holding at least one vector row a metadata filter
- * admits. The filter runs once per document and EXISTS probes for a row, so
- * the cost follows the documents in scope rather than their chunk count.
+ * admits. Document-scoped eligibility avoids applying the metadata predicate
+ * directly to the chunk join; EXISTS checks for a vector row in that collection.
  */
 function metadataEligibleCollections(db: Database, filter: MetadataFilter): Set<number> {
-  const current = compileCurrentMetadataFilter(filter);
+  const docIds = eligibleDocumentIdsSql(filter);
   const rows = db.prepare(`
     SELECT DISTINCT ci.id AS collectionId
     FROM documents d
-    JOIN document_metadata dm ON dm.document_id = d.id
     JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.name = d.collection
-    WHERE d.active = 1 AND ${current.sql}
+    WHERE d.id IN (${docIds.sql})
       AND EXISTS (SELECT 1 FROM ${VEC_ROWS_TABLE} vr WHERE vr.hash = d.hash AND vr.collection_id = ci.id)
-  `).all(...current.params) as { collectionId: number }[];
+  `).all(...docIds.params) as { collectionId: number }[];
   return new Set(rows.map(row => row.collectionId));
 }
 
@@ -4919,7 +5376,7 @@ function metadataEligibleCollections(db: Database, filter: MetadataFilter): Set<
 function vecDocumentResolver(db: Database, filter?: MetadataFilter): (matches: readonly VecMatch[]) => VecDocumentMatch[] {
   // Re-apply the filter on the document join: vectors are content-scoped,
   // so one hash can belong to both matching and non-matching documents.
-  const current = filter ? compileCurrentMetadataFilter(filter) : undefined;
+  const docIds = filter ? eligibleDocumentIdsSql(filter) : undefined;
   const statement = withLazyContentVectorMigration(db, () => db.prepare(`
     SELECT
       vr.id AS rowid,
@@ -4936,12 +5393,12 @@ function vecDocumentResolver(db: Database, filter?: MetadataFilter): (matches: r
     JOIN documents d ON d.hash = vr.hash AND d.collection = ci.name
     JOIN content ON content.hash = d.hash
     LEFT JOIN document_metadata dm ON dm.document_id = d.id
-    WHERE d.active = 1${current ? ` AND ${current.sql}` : ""}
+    WHERE d.active = 1${docIds ? ` AND d.id IN (${docIds.sql})` : ""}
   `));
   return (matches) => {
     if (matches.length === 0) return [];
     const distanceByRowid = new Map(matches.map(r => [r.rowid, r.distance]));
-    const rows = statement.all(rowidList(matches.map(r => r.rowid)), ...(current?.params ?? [])) as Omit<VecDocumentMatch, "distance">[];
+    const rows = statement.all(rowidList(matches.map(r => r.rowid)), ...(docIds?.params ?? [])) as Omit<VecDocumentMatch, "distance">[];
     const best = new Map<string, VecDocumentMatch>();
     for (const row of rows) {
       const distance = distanceByRowid.get(row.rowid) ?? 1;
@@ -4973,10 +5430,37 @@ function nearestVecDocuments(
   }
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
+export interface EmbeddingQueryContext {
+  readonly capability: EmbeddingCapability;
+  readonly precomputedIdentity?: string;
+}
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter, context?: EmbeddingQueryContext): Promise<SearchResult[]> {
+  let embedding: number[] | null | undefined = precomputedEmbedding;
+  if (context) {
+    const cap = context.capability;
+    if (model !== cap.modelLabel) throw new Error("Query model does not match the selected embedding producer");
+    const identity = await cap.prepare();
+    planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "query" });
+    if (cap.config.backend === "onnx") await assertEmbeddingQueryFits(cap, cap.config.recipe, query);
+    if (precomputedEmbedding !== undefined && identity.kind === "onnx-v1" && context.precomputedIdentity !== identity.id) {
+      throw new Error("Precomputed ONNX vector requires the matching full embedding identity");
+    }
+    if (hasVectorIndex(db)) {
+      const vectors = precomputedEmbedding !== undefined ? [new Float32Array(precomputedEmbedding)] : await cap.embed([{ kind: "query", text: query }]);
+      const dimensions = identity.kind === "onnx-v1" ? identity.descriptor.dimensions : identity.dimensions;
+      validateEmbeddingVectors(vectors, 1, dimensions, dimensions);
+      planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "query" });
+      const vector = vectors[0];
+      if (!vector) throw new Error("Missing prepared query vector");
+      embedding = Array.from(vector);
+    }
+  } else {
+    const space = readEmbeddingSpace(db);
+    if (space.kind === "onnx-v1" || space.kind === "ambiguous") throw new Error("Vector search requires the matching embedding producer identity/context");
+  }
   if (!hasVectorIndex(db)) return [];
 
-  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
+  embedding ??= await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
 
   const names = scopedCollectionNames(collectionName);
@@ -5157,7 +5641,8 @@ export const VECTOR_COPY_BATCH_ROWS = 1000;
  * copy; an interrupted run resumes from whatever missingPartitionRows still
  * reports.
  */
-export function copyVectorsToNewCollections(db: Database, collection?: string): { copied: number; queued: number } {
+export function copyVectorsToNewCollections(db: Database, collection?: string, identity?: EmbeddingIdentity): { copied: number; queued: number } {
+  if (identity) planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "embed", collection });
   const layout = vecLayout(db);
   if (layout.kind === "legacy" || !isSqliteVecAvailable()) return { copied: 0, queued: 0 };
   return withLazyContentVectorMigration(db, () => {
@@ -5189,7 +5674,10 @@ export function copyVectorsToNewCollections(db: Database, collection?: string): 
     };
     for (let start = 0; start < missing.length; start += VECTOR_COPY_BATCH_ROWS) {
       const batch = missing.slice(start, start + VECTOR_COPY_BATCH_ROWS);
-      db.transaction(() => copyBatch(batch)).immediate();
+      db.transaction(() => {
+        if (identity) planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "embed", collection });
+        copyBatch(batch);
+      }).immediate();
     }
     return { copied, queued: queued.size };
   });
@@ -5223,23 +5711,25 @@ export function insertEmbedding(
   });
 }
 
-function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
-  return withLazyContentVectorMigration(db, () => {
+function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, identity: EmbeddingIdentity): number {
+  return db.transaction(() => {
+    planEmbeddingAdmission(readEmbeddingSpace(db), identity, { kind: "embed" });
     let removed = 0;
-    const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);
-    const deleteContentStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND model = ?`);
+    const fingerprint = identity.kind === "onnx-v1" ? identity.id : identity.fingerprint;
+    const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND embed_fingerprint = ? ORDER BY seq`);
+    const deleteContentStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND embed_fingerprint = ?`);
 
     for (const [hash, expectedChunks] of expectedChunksByHash) {
-      const rows = rowsStmt.all(hash, model) as { seq: number }[];
-      if (rows.length === 0 || rows.length === expectedChunks) continue;
+      const rows = rowsStmt.all<{ seq: number }>(hash, fingerprint);
+      if (rows.length === 0 || (rows.length === expectedChunks && rows.every((row, index) => row.seq === index))) continue;
 
       deletePartitionRowsOfHash(db, hash);
-      deleteContentStmt.run(hash, model);
+      deleteContentStmt.run(hash, fingerprint);
       removed += rows.length;
     }
 
     return removed;
-  });
+  }).immediate();
 }
 
 // =============================================================================
@@ -6188,6 +6678,7 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
+  expand?: boolean;
   collection?: string | readonly string[];
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
@@ -6261,11 +6752,53 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
  * 7. Position-aware score blending (RRF rank × reranker score)
  * 8. Dedup by file, filter by minScore, slice to limit
  */
+function storeSearchStagePolicy(store: Store, request: SearchStageRequest = {}) {
+  return resolveSearchStagePolicy(store.embeddingConfig ?? { backend: "gguf", model: store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL }, request);
+}
+
+async function withStoreQueryLease<T>(store: Store, operation: () => Promise<T>): Promise<T> {
+  const lifecycle = lifecycleFor(store);
+  if (lifecycle.closing) throw new Error("Store is closing");
+  lifecycle.activeEmbeddingOperations++;
+  try { return await operation(); }
+  finally {
+    lifecycle.activeEmbeddingOperations--;
+    if (lifecycle.activeEmbeddingOperations === 0) {
+      lifecycle.drained?.(); lifecycle.drained = undefined; lifecycle.drainPromise = undefined;
+    }
+  }
+}
+
+async function embedSearchQueries(store: Store, queries: readonly string[]): Promise<{ model: string; embeddings: (number[] | undefined)[]; identity?: string }> {
+  const cap = store.embedding;
+  if (!cap) {
+    const llm = getLlm(store), model = llm.embedModelName;
+    const results = await llm.embedBatch(queries.map(query => formatQueryForEmbedding(query, model)));
+    return { model, embeddings: results.map(result => result?.embedding) };
+  }
+  const identity = await cap.prepare();
+  planEmbeddingAdmission(readEmbeddingSpace(store.db), identity, { kind: "query" });
+  if (cap.config.backend === "onnx") {
+    for (const query of queries) await assertEmbeddingQueryFits(cap, cap.config.recipe, query);
+  }
+  const vectors = await cap.embed(queries.map(text => ({ kind: "query", text })));
+  const dimensions = identity.kind === "onnx-v1" ? identity.descriptor.dimensions : identity.dimensions;
+  validateEmbeddingVectors(vectors, queries.length, dimensions, dimensions);
+  planEmbeddingAdmission(readEmbeddingSpace(store.db), identity, { kind: "query" });
+  return { model: cap.modelLabel, embeddings: vectors.map(vector => Array.from(vector)), identity: identity.kind === "onnx-v1" ? identity.id : identity.fingerprint };
+}
+
 export async function hybridQuery(
   store: Store,
   query: string,
   options?: HybridQueryOptions
 ): Promise<HybridQueryResult[]> {
+  return withStoreQueryLease(store, () => runHybridQuery(store, query, options));
+}
+
+async function runHybridQuery(store: Store, query: string, options?: HybridQueryOptions
+): Promise<HybridQueryResult[]> {
+  const policy = storeSearchStagePolicy(store, { expand: options?.expand, rerank: options?.skipRerank === undefined ? undefined : !options.skipRerank });
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -6273,7 +6806,7 @@ export async function hybridQuery(
   const filter = options?.filter;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  const skipRerank = !policy.rerank;
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -6298,13 +6831,13 @@ export async function hybridQuery(
   if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
 
   // Step 2: Expand query (or skip if strong signal)
-  hooks?.onExpandStart?.();
+  if (policy.expand) hooks?.onExpandStart?.();
   const expandStart = Date.now();
-  const expanded = hasStrongSignal
+  const expanded = hasStrongSignal || !policy.expand
     ? []
     : await store.expandQuery(query);
 
-  hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
+  if (policy.expand) hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
@@ -6349,22 +6882,19 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
-    const embedModel = llm.embedModelName;
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
-    hooks?.onEmbedStart?.(textsToEmbed.length);
+    hooks?.onEmbedStart?.(vecQueries.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embedded = await embedSearchQueries(store, vecQueries.map(q => q.text));
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
-      const embedding = embeddings[i]?.embedding;
+      const embedding = embedded.embeddings[i];
       if (!embedding) continue;
 
       const vecResults = await store.searchVec(
-        vecQueries[i]!.text, embedModel, 20, collection,
-        undefined, embedding, filter
+        vecQueries[i]!.text, embedded.model, 20, collection,
+        undefined, embedding, filter, embedded.identity
       );
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -6594,6 +7124,12 @@ export async function vectorSearchQuery(
   query: string,
   options?: VectorSearchOptions
 ): Promise<VectorSearchResult[]> {
+  return withStoreQueryLease(store, () => runVectorSearchQuery(store, query, options));
+}
+
+async function runVectorSearchQuery(store: Store, query: string, options?: VectorSearchOptions
+): Promise<VectorSearchResult[]> {
+  const policy = storeSearchStagePolicy(store, { rerank: false });
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
@@ -6605,12 +7141,12 @@ export async function vectorSearchQuery(
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
   const expandStart = Date.now();
-  const allExpanded = await store.expandQuery(query);
+  const allExpanded = policy.expand ? await store.expandQuery(query) : [];
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
-  options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
+  if (policy.expand) options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
-  const embedModel = getLlm(store).embedModelName;
+  const embedModel = store.embedding?.modelLabel ?? getLlm(store).embedModelName;
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
@@ -6684,12 +7220,18 @@ export async function structuredSearch(
   searches: ExpandedQuery[],
   options?: StructuredSearchOptions
 ): Promise<HybridQueryResult[]> {
+  return withStoreQueryLease(store, () => runStructuredSearch(store, searches, options));
+}
+
+async function runStructuredSearch(store: Store, searches: ExpandedQuery[], options?: StructuredSearchOptions
+): Promise<HybridQueryResult[]> {
+  const policy = storeSearchStagePolicy(store, { rerank: options?.skipRerank === undefined ? undefined : !options.skipRerank });
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  const skipRerank = !policy.rerank;
   const hooks = options?.hooks;
 
   const collections = options?.collections;
@@ -6751,21 +7293,18 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const embedModel = llm.embedModelName;
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
-      hooks?.onEmbedStart?.(textsToEmbed.length);
+      hooks?.onEmbedStart?.(vecSearches.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embedded = await embedSearchQueries(store, vecSearches.map(s => s.query));
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {
-        const embedding = embeddings[i]?.embedding;
+        const embedding = embedded.embeddings[i];
         if (!embedding) continue;
 
         const vecResults = await store.searchVec(
-          vecSearches[i]!.query, embedModel, 20, collections,
-          undefined, embedding, filter
+          vecSearches[i]!.query, embedded.model, 20, collections,
+          undefined, embedding, filter, embedded.identity
         );
         if (vecResults.length > 0) {
           for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -6793,7 +7332,7 @@ export async function structuredSearch(
 
   if (candidates.length === 0) return [];
 
-  hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
+  if (policy.expand) hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
 
   // Step 4: Chunk documents, pick best chunk per doc for reranking
   // Use first lex query as the "query" for keyword matching, or first vec if no lex

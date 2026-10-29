@@ -30,6 +30,7 @@ import { replaceDocumentMetadata } from "../src/metadata-store.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "../src/metadata.js";
 import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server.js";
 import type { CollectionConfig } from "../src/collections.js";
+import { setConfigSource } from "../src/collections.js";
 
 let testDir: string;
 
@@ -225,19 +226,26 @@ describe("MCP and HTTP metadata filter", () => {
 
     process.env.INDEX_PATH = dbPath;
     process.env.QMD_CONFIG_DIR = configDir;
+    setConfigSource({ configPath: join(configDir, "index.yml") });
     handle = await startMcpHttpServer(0, { quiet: true, dbPath });
     baseUrl = `http://localhost:${handle.port}`;
   });
 
   afterAll(async () => {
-    if (handle) await handle.stop();
-    _resetProductionModeForTesting();
+    const errors: unknown[] = [];
+    try { if (handle) await handle.stop(); } catch (error) { errors.push(error); }
+    try { _resetProductionModeForTesting(); } catch (error) { errors.push(error); }
+    setConfigSource(undefined);
     if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
     else delete process.env.INDEX_PATH;
     if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
     else delete process.env.QMD_CONFIG_DIR;
-    try { unlinkSync(dbPath); } catch {}
-    await rm(configDir, { recursive: true, force: true });
+    try { unlinkSync(dbPath); } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") errors.push(error);
+    }
+    try { if (configDir) await rm(configDir, { recursive: true, force: true }); }
+    catch (error) { errors.push(error); }
+    if (errors.length > 0) throw errors[0];
   });
 
   type HttpRequestBody = Record<string, unknown>;

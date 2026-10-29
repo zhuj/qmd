@@ -99,7 +99,7 @@ describe("doctor vector sampling", () => {
     expect(getEmbeddingVectorSamples(store.db, "missing", "current")).toEqual([]);
   });
 
-  test("samples large documents with duplicate paths within a 32 MiB SQLite budget", () => {
+  test("samples large documents with duplicate paths with a requested 32 MiB heap limit", () => {
     // SQLite's hard heap limit is process-wide and cannot be raised again.
     const worker = join(projectRoot, "test", "_helpers", "doctor-vector-sample-worker.ts");
     const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
@@ -110,7 +110,7 @@ describe("doctor vector sampling", () => {
     expect(JSON.parse(result.stdout)).toEqual({ samples: 3, distinctChunks: 3, bodiesComplete: true });
   });
 
-  test("the doctor check verifies large documents with duplicate paths within a 32 MiB SQLite budget", () => {
+  test("doctor reproduces large duplicate-path documents (32 MiB heap probe)", () => {
     // SQLite's hard heap limit is process-wide and cannot be raised again.
     const worker = join(projectRoot, "test", "_helpers", "doctor-vector-check-worker.ts");
     const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
@@ -120,7 +120,8 @@ describe("doctor vector sampling", () => {
     expect(result.status).toBe(0);
     const out = JSON.parse(result.stdout);
     expect(out).toMatchObject({ ok: true, details: "3 sampled chunks reproduce stored vectors" });
-    // The budget only binds where SQLite tracks memory; on Bun under Linux it must.
-    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(true);
+    expect(typeof out.limitBinds).toBe("boolean");
+    expect(out.runtime).toBe(isBun ? "bun" : "node");
+    expect(out.budgetBytes).toBe(33554432);
   });
 });

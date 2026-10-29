@@ -7,7 +7,7 @@
  * collection management.
  */
 
-import { Database } from "bun:sqlite";
+import Database from "better-sqlite3";
 import { join } from "path";
 import { homedir } from "os";
 
@@ -35,17 +35,18 @@ try {
 
   // Step 2: Populate collection names from collections table
   console.log(`\n${c.yellow}2. Populating collection names...${c.reset}`);
-  const result = db.exec(`
+  const updateStmt = db.prepare(`
     UPDATE documents
     SET collection = (
       SELECT name FROM collections WHERE collections.id = documents.collection_id
     )
     WHERE collection IS NULL
   `);
+  const result = updateStmt.run().changes;
   console.log(`  ${c.green}✓${c.reset} Updated ${result} rows`);
 
   // Step 3: Verify no NULL values
-  const nullCount = db.query<{ count: number }, []>(
+  const nullCount = db.prepare<[], { count: number }>(
     `SELECT COUNT(*) as count FROM documents WHERE collection IS NULL`
   ).get();
 
@@ -80,7 +81,7 @@ try {
     SELECT id, collection, path, title, hash, created_at, modified_at, active
     FROM documents
   `);
-  const rowCount = db.query<{ count: number }, []>(
+  const rowCount = db.prepare<[], { count: number }>(
     `SELECT COUNT(*) as count FROM documents_new`
   ).get();
   console.log(`  ${c.green}✓${c.reset} Copied ${rowCount?.count} documents`);
@@ -139,7 +140,7 @@ try {
   console.log(`\n${c.green}✓ Migration completed successfully!${c.reset}`);
 
   // Show summary
-  const collections = db.query<{ collection: string; count: number }, []>(`
+  const collections = db.prepare<[], { collection: string; count: number }>(`
     SELECT collection, COUNT(*) as count
     FROM documents
     WHERE active = 1

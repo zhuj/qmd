@@ -20,7 +20,11 @@ describe("package test task", () => {
     expect(testAllScript).toContain("TypeScript build typecheck");
     expect(testAllScript).toContain("Vitest suite under Node");
     expect(testAllScript).toContain("Bun test suite");
+    expect(testAllScript).toContain("Rule tests (oxlint)");
     expect(testAllScript).toContain("Package smoke");
+
+    expect(pkg.scripts["test:bun"]).toContain("scripts/test-bun.mjs");
+    expect(pkg.scripts["test:oxlint"]).toContain("scripts/test-oxlint.mjs");
 
     const packageSmokeScript = readFileSync(new URL("scripts/package-smoke.mjs", root), "utf8");
     expect(packageSmokeScript).toContain("scripts/build.mjs");

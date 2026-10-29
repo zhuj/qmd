@@ -9,6 +9,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname, resolve } from "path";
 import { qmdHomedir } from "./paths.js";
 import YAML from "yaml";
+import { availableParallelism } from "os";
+import { z } from "zod";
+import { parseOnnxEmbeddingConfig } from "./embeddings/config.js";
+import type { OnnxEmbeddingConfig } from "./embeddings/types.js";
 
 // ============================================================================
 // Types
@@ -37,7 +41,7 @@ export interface Collection {
  * Model configuration for embedding, reranking, and generation
  */
 export interface ModelsConfig {
-  embed?: string;
+  embed?: string | OnnxEmbeddingConfig;
   rerank?: string;
   generate?: string;
 }
@@ -62,6 +66,27 @@ export interface NamedCollection extends Collection {
   name: string;
 }
 
+const collectionSchema = z.object({
+  path: z.string(), pattern: z.string().default("**/*.md"), ignore: z.array(z.string()).optional(),
+  context: z.record(z.string(), z.string()).optional(), update: z.string().optional(),
+  includeByDefault: z.boolean().optional(),
+}).passthrough();
+
+/** Validate file and plain-JS model settings without persisting inferred defaults. */
+export function parseCollectionConfig(value: unknown, configPath?: string): CollectionConfig {
+  return z.object({
+    global_context: z.string().optional(),
+    editor_uri: z.string().optional(), editor_uri_template: z.string().optional(),
+    editorUri: z.string().optional(), "editor-uri": z.string().optional(),
+    collections: z.record(z.string(), collectionSchema).default({}),
+    models: z.strictObject({
+      embed: z.unknown().transform(value => value === undefined || typeof value === "string"
+        ? value : parseOnnxEmbeddingConfig(value, { configPath, hostParallelism: availableParallelism() })).optional(),
+      rerank: z.string().optional(), generate: z.string().optional(),
+    }).optional(),
+  }).passthrough().parse(value ?? {});
+}
+
 // ============================================================================
 // Configuration paths
 // ============================================================================
@@ -84,10 +109,6 @@ export function setConfigSource(source?: { configPath?: string; config?: Collect
     return;
   }
   if (source.config) {
-    // Ensure collections object exists
-    if (!source.config.collections) {
-      source.config.collections = {};
-    }
     configSource = { type: 'inline', config: source.config };
   } else if (source.configPath) {
     configSource = { type: 'file', path: source.configPath };
@@ -176,14 +197,14 @@ function ensureConfigDir(): void {
 
 /**
  * Load configuration from the configured source.
- * - Inline config: returns the in-memory object directly
+ * - Inline config: parses a copy of the in-memory settings
  * - File-based: reads from YAML file (default ~/.config/qmd/index.yml)
  * Returns empty config if file doesn't exist
  */
 export function loadConfig(): CollectionConfig {
   // SDK inline config mode
   if (configSource.type === 'inline') {
-    return configSource.config;
+    return parseCollectionConfig(configSource.config);
   }
 
   // File-based config (SDK custom path or default)
@@ -194,15 +215,7 @@ export function loadConfig(): CollectionConfig {
 
   try {
     const content = readFileSync(configPath, "utf-8");
-    const parsed = YAML.parse(content) as CollectionConfig | null | undefined;
-    const config = parsed ?? { collections: {} };
-
-    // Ensure collections object exists
-    if (!config.collections) {
-      config.collections = {};
-    }
-
-    return config;
+    return parseCollectionConfig(YAML.parse(content), configPath);
   } catch (error) {
     throw new Error(`Failed to parse ${configPath}: ${error}`);
   }

@@ -663,8 +663,8 @@ describe("structuredSearch collection scope", () => {
   test("a vec leg over several collections runs one vector search over the whole list", async () => {
     store.ensureVecTable(3);
     store.llm = {
-      embedModelName: "scope-embed-model",
-      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [1, 0, 0], model: "scope-embed-model" })),
+      embedModelName: "hf:example/scope-embed/scope.gguf",
+      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [1, 0, 0], model: "hf:example/scope-embed/scope.gguf" })),
     } as any;
     const searchVec = vi.fn<Store["searchVec"]>(async () => []);
     store.searchVec = searchVec;
@@ -676,7 +676,7 @@ describe("structuredSearch collection scope", () => {
   });
 
   test("a vec leg ranks the same whichever order the collections are named in", async () => {
-    const embedModel = "scope-embed-model";
+    const embedModel = "hf:example/scope-embed/scope.gguf";
     store.ensureVecTable(3);
     store.llm = {
       embedModelName: embedModel,

@@ -24,6 +24,7 @@ import {
 } from "../src/index.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
 import { VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE } from "../src/vec-layout.js";
+import { DEFAULT_EMBED_MODEL } from "../src/store.js";
 
 // =============================================================================
 // Test Helpers
@@ -968,21 +969,51 @@ describe("embed", () => {
     };
   }
 
+  function spyStoreEmbedLlm(store: QMDStore): { restore: () => void; embedBatchCalls: string[][] } {
+    if (!store.internal || !store.internal.llm) throw new Error("Store internal.llm missing");
+    const llm = store.internal.llm;
+    const fake = createFakeEmbedLlm();
+    // The capability captures this instance, so replace its ports, not the store pointer.
+    const origEmbed = llm.embed;
+    const origEmbedBatch = llm.embedBatch;
+    const origTokenize = llm.tokenize;
+    const origDetokenize = llm.detokenize;
+    const origDispose = llm.dispose;
+    llm.embed = fake.embed.bind(fake) as typeof llm.embed;
+    llm.embedBatch = async (texts: string[]) => fake.embedBatch(texts);
+    llm.tokenize = fake.tokenize.bind(fake) as typeof llm.tokenize;
+    llm.detokenize = fake.detokenize.bind(fake) as typeof llm.detokenize;
+    llm.dispose = fake.dispose.bind(fake) as typeof llm.dispose;
+    return {
+      restore: () => {
+        if (origEmbed) llm.embed = origEmbed;
+        if (origEmbedBatch) llm.embedBatch = origEmbedBatch;
+        if (origTokenize) llm.tokenize = origTokenize;
+        if (origDetokenize) llm.detokenize = origDetokenize;
+        if (origDispose) llm.dispose = origDispose;
+      },
+      embedBatchCalls: fake.embedBatchCalls,
+    };
+  }
+
   function createFakeEmbedLlm() {
     const embedBatchCalls: string[][] = [];
+    const modelName = DEFAULT_EMBED_MODEL;
     return {
       ...createFakeTokenizer(),
       embedBatchCalls,
+      embedModelName: modelName,
       async embed(_text: string) {
-        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+        return { embedding: [0.1, 0.2, 0.3], model: modelName };
       },
       async embedBatch(texts: string[]) {
         embedBatchCalls.push([...texts]);
         return texts.map((_text, index) => ({
           embedding: [index + 1, index + 2, index + 3],
-          model: "fake-embed",
+          model: modelName,
         }));
       },
+      async dispose() {},
     };
   }
 
@@ -996,9 +1027,8 @@ describe("embed", () => {
       },
     });
 
-    const fakeLlm = createFakeEmbedLlm();
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.internal.llm = fakeLlm as any;
+    const spy = spyStoreEmbedLlm(store);
+    const fakeLlm = spy;
 
     try {
       await store.update();
@@ -1013,7 +1043,7 @@ describe("embed", () => {
       expect(result.chunksEmbedded).toBe(3);
     } finally {
       setDefaultLlamaCpp(null);
-      await store.close();
+      try { await store.close(); } finally { spy.restore(); }
     }
   });
 
@@ -1028,9 +1058,7 @@ describe("embed", () => {
       },
     });
 
-    const fakeLlm = createFakeEmbedLlm();
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.internal.llm = fakeLlm as any;
+    const spy = spyStoreEmbedLlm(store);
 
     try {
       await store.update();
@@ -1053,7 +1081,7 @@ describe("embed", () => {
       ]);
     } finally {
       setDefaultLlamaCpp(null);
-      await store.close();
+      try { await store.close(); } finally { spy.restore(); }
     }
   });
 
@@ -1068,9 +1096,7 @@ describe("embed", () => {
       },
     });
 
-    const fakeLlm = createFakeEmbedLlm();
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.internal.llm = fakeLlm as any;
+    const spy = spyStoreEmbedLlm(store);
 
     const vectorCounts = () => store.internal.db.prepare(`
       SELECT d.collection, COUNT(DISTINCT v.hash) AS count
@@ -1099,7 +1125,7 @@ describe("embed", () => {
       ]);
     } finally {
       setDefaultLlamaCpp(null);
-      await store.close();
+      try { await store.close(); } finally { spy.restore(); }
     }
   });
 
@@ -1121,8 +1147,7 @@ describe("embed", () => {
         },
       },
     });
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.internal.llm = createFakeEmbedLlm() as any;
+    const spy = spyStoreEmbedLlm(store);
 
     const partitionsOf = (path: string): string[] => {
       const doc = store.internal.db.prepare(`SELECT hash FROM documents WHERE path = ? LIMIT 1`).get(path) as { hash: string };
@@ -1153,7 +1178,7 @@ describe("embed", () => {
       expect(partitionsOf("gone.md")).toEqual([]);
     } finally {
       setDefaultLlamaCpp(null);
-      await store.close();
+      try { await store.close(); } finally { spy.restore(); }
     }
   });
 
@@ -1173,8 +1198,7 @@ describe("embed", () => {
         },
       },
     });
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.internal.llm = createFakeEmbedLlm() as any;
+    const spy = spyStoreEmbedLlm(store);
 
     const db = store.internal.db;
     const hashOf = () =>
@@ -1209,22 +1233,24 @@ describe("embed", () => {
       expect(result.needsEmbedding).toBe(0);
     } finally {
       setDefaultLlamaCpp(null);
-      await store.close();
+      try { await store.close(); } finally { spy.restore(); }
     }
   });
 
   test("store.embed rejects invalid batch limits", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),
-      config: { collections: {} },
+      config: { collections: { docs: { path: docsDir, pattern: "**/*.md" } } },
     });
+    const spy = spyStoreEmbedLlm(store);
 
     try {
+      await store.update();
       await expect(store.embed({ maxDocsPerBatch: 0 })).rejects.toThrow("maxDocsPerBatch");
       await expect(store.embed({ maxBatchBytes: 0 })).rejects.toThrow("maxBatchBytes");
     } finally {
       setDefaultLlamaCpp(null);
-      await store.close();
+      try { await store.close(); } finally { spy.restore(); }
     }
   });
 });

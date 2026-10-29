@@ -8,7 +8,7 @@
  * - `update:` — a shell command run by `qmd update` (#886)
  * - `collections.*.path` — any directory the process can read (#889)
  * - `models.embed` / `models.rerank` / `models.generate` — any `hf:` repo or
- *   local GGUF path (#889)
+ *   local GGUF path (#889), or a structured ONNX embedding descriptor
  *
  * Global `~/.config/qmd` is never gated. In-project collection paths and the
  * built-in default model URIs are also allowed without approval: those are
@@ -23,6 +23,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { getConfigDir } from "./collections.js";
 import { qmdHomedir } from "./paths.js";
+import type { ResolvedOnnxConfig } from "./embeddings/types.js";
 
 /** A collection's pre-update hook, as it will be executed. */
 export type UpdateHook = {
@@ -38,7 +39,7 @@ export type CollectionPath = {
 export type ModelSlot = "embed" | "rerank" | "generate";
 
 export type ModelsSnapshot = {
-  embed?: string;
+  embed?: string | ResolvedOnnxConfig;
   rerank?: string;
   generate?: string;
 };
@@ -49,13 +50,17 @@ export type SensitiveSnapshot = {
   models: ModelsSnapshot;
 };
 
+export type GatedModel =
+  | { kind: "uri"; slot: ModelSlot; uri: string }
+  | { kind: "onnx"; slot: "embed"; uri: string; descriptor: ResolvedOnnxConfig };
+
 export type GatedItems = {
   hooks: UpdateHook[];
   paths: CollectionPath[];
-  models: Array<{ slot: ModelSlot; uri: string }>;
+  models: GatedModel[];
 };
 
-export type BuiltinModels = Required<ModelsSnapshot>;
+export type BuiltinModels = { embed: string; rerank: string; generate: string };
 
 export type TrustRecord = {
   /** Digest of the gated set that was approved. */
@@ -132,16 +137,43 @@ export function isCollectionPathInsideProject(configPath: string, rawPath: strin
   return !rel.split(/[/\\]/).includes("..");
 }
 
+function onnxTrustUri(config: ResolvedOnnxConfig): string {
+  const recipe = config.recipe;
+  const source = (() => {
+    switch (config.source.kind) {
+      case "huggingface": return ["huggingface", config.source.model, config.source.revision.toLowerCase()];
+      case "local": return ["local", config.source.path];
+      default: { const exhaustive: never = config.source; throw new Error(`Unsupported model source: ${exhaustive}`); }
+    }
+  })();
+  // Explicit field order binds all declared execution/acquisition controls without
+  // making approval sensitive to YAML/object property insertion order.
+  return `onnx-config-v1:${JSON.stringify({ source,
+    recipe: [recipe.version, recipe.pooling, recipe.normalization, recipe.queryPrefix, recipe.documentPrefix,
+      recipe.maxInputTokens, recipe.titleBudgetTokens, recipe.overlapTokens,
+      recipe.clsTokenIndex ?? null, recipe.sentenceOutput ?? null, recipe.reduction?.profile ?? null],
+    device: config.device, fallback: config.fallback, dtype: config.dtype, dimensions: config.dimensions,
+    allowDownload: config.allowDownload, intraOpNumThreads: config.intraOpNumThreads,
+    batchSize: config.batchSize, maxBatchTokens: config.maxBatchTokens })}`;
+}
+
 export function gatedModels(
   models: ModelsSnapshot,
   builtins: BuiltinModels,
-): Array<{ slot: ModelSlot; uri: string }> {
-  const out: Array<{ slot: ModelSlot; uri: string }> = [];
-  for (const slot of ["embed", "rerank", "generate"] as const) {
+): GatedModel[] {
+  const out: GatedModel[] = [];
+  const embed = models.embed;
+  if (embed && typeof embed !== "string") {
+    out.push({ kind: "onnx", slot: "embed", uri: onnxTrustUri(embed), descriptor: embed });
+  } else if (embed && embed !== builtins.embed) {
+    out.push({ kind: "uri", slot: "embed", uri: embed });
+  }
+  const stageSlots: readonly ("rerank" | "generate")[] = ["rerank", "generate"];
+  for (const slot of stageSlots) {
     const uri = models[slot];
     if (!uri) continue;
     if (uri === builtins[slot]) continue;
-    out.push({ slot, uri });
+    out.push({ kind: "uri", slot, uri });
   }
   return out;
 }
@@ -200,8 +232,14 @@ export function sensitiveDigest(
       .map(p => [p.collection, resolveConfigCollectionPath(p.path, configPath)] as [string, string])
       .sort(byFirst),
     models: gated.models
-      .map(m => [m.slot, m.uri] as [string, string])
-      .sort(byFirst),
+      .sort((a, b) => byFirst([a.slot], [b.slot]))
+      .map(m => {
+        switch (m.kind) {
+          case "uri": return [m.slot, m.uri];
+          case "onnx": return [m.slot, { backend: "onnx", configuration: m.uri }];
+          default: { const exhaustive: never = m; throw new Error(`Unsupported gated model: ${exhaustive}`); }
+        }
+      }),
   });
   return createHash("sha256").update(canonical).digest("hex");
 }

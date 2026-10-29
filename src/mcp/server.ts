@@ -35,9 +35,10 @@ import {
   MetadataBindingBudgetError,
   MetadataOptionError,
 } from "../index.js";
-import { getConfigPath } from "../collections.js";
+import { getConfigPath, loadConfig } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
-import { enableProductionMode } from "../store.js";
+import { enableProductionMode, DEFAULT_EMBED_MODEL, DEFAULT_RERANK_MODEL, DEFAULT_QUERY_MODEL } from "../store.js";
+import { approveEntryConfig } from "../embeddings/entry-config.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
 // =============================================================================
@@ -423,8 +424,8 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
-        rerank: z.boolean().optional().default(true).describe(
-          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
+        rerank: z.boolean().optional().describe(
+          "Rerank results using LLM (default configured by store policy; set false for faster CPU-only results, omit for policy default)."
         ),
       }),
     },
@@ -994,8 +995,14 @@ export function registerStdioEofShutdown(options: StdioShutdownOptions): () => P
   const shutdown = (): Promise<void> => (shutdownPromise ??= performShutdown());
   const onStdinEof = (): void => { void shutdown().catch(() => {}); };
 
-  stdin.once("end", onStdinEof);
-  stdin.once("close", onStdinEof);
+  try {
+    stdin.once("end", onStdinEof);
+    stdin.once("close", onStdinEof);
+  } catch (error) {
+    try { stdin.off("end", onStdinEof); } catch { /* preserve primary */ }
+    try { stdin.off("close", onStdinEof); } catch { /* preserve primary */ }
+    throw error;
+  }
 
   // The parent can die between spawn and listener registration; check the
   // stream flags after subscribing so an already-ended stdin still shuts down.
@@ -1006,6 +1013,23 @@ export function registerStdioEofShutdown(options: StdioShutdownOptions): () => P
   return shutdown;
 }
 
+async function buildApprovedStore(options: McpStartupOptions): Promise<QMDStore> {
+  const configPath = getConfigPath();
+  if (configPath === '<inline>') throw new Error('MCP entry startup requires a file-backed configuration source; select its config file again before restarting');
+  const dbPath = options.dbPath ?? getDefaultDbPath();
+  if (existsSync(configPath)) {
+    const captured = loadConfig();
+    const approved = approveEntryConfig(
+      configPath,
+      captured,
+      { embed: DEFAULT_EMBED_MODEL, rerank: DEFAULT_RERANK_MODEL, generate: DEFAULT_QUERY_MODEL },
+      false,
+    );
+    return await createStore({ dbPath, config: approved.config });
+  }
+  return await createStore({ dbPath });
+}
+
 export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
   // Opt into production mode when the MCP server is actually started, not
   // when this module is merely imported for its exports. Importing the module
@@ -1013,27 +1037,28 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   // isolation for downstream suites that expect the default (development)
   // database path behaviour.
   enableProductionMode();
-  const configPath = getConfigPath();
-  const store = await createStore({
-    dbPath: options.dbPath ?? getDefaultDbPath(),
-    ...(existsSync(configPath) ? { configPath } : {}),
-  });
-  const inflight = createInflightGate();
-  // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
-  // (opening exchange pins the era). A hand-wired StdioServerTransport would
-  // stay 2025-only even on SDK 2.x.
-  const handle = serveStdio(() => createMcpServer(store, inflight));
-
-  // Follow the parent's lifecycle: when stdin reaches EOF the client is gone
-  // and the server must exit instead of orphaning to PID 1 (#751). No
-  // disposeLlm here — store.close() disposes this store's own LlamaCpp
-  // instance, so passing the global disposeDefaultLlamaCpp would only risk
-  // tearing down an unrelated instance in an embedded process.
-  registerStdioEofShutdown({
-    closeServer: () => handle.close(),
-    waitForIdle: (timeoutMs) => inflight.waitForIdle(timeoutMs),
-    closeStore: () => store.close(),
-  });
+  let ownedStore: QMDStore | undefined;
+  let ownedHandle: { close(): void | Promise<void> } | undefined;
+  try {
+    const store = await buildApprovedStore(options);
+    ownedStore = store;
+    const inflight = createInflightGate();
+    const handle = serveStdio(() => createMcpServer(store, inflight));
+    ownedHandle = handle;
+    registerStdioEofShutdown({
+      closeServer: () => handle.close(),
+      waitForIdle: (timeoutMs) => inflight.waitForIdle(timeoutMs),
+      closeStore: () => store.close(),
+    });
+  } catch (error) {
+    if (ownedHandle) {
+      try { await ownedHandle.close(); } catch { /* Preserve primary startup failure while attempting remaining cleanup. */ }
+    }
+    if (ownedStore) {
+      try { await ownedStore.close(); } catch { /* preserve primary */ }
+    }
+    throw error;
+  }
 }
 
 // =============================================================================
@@ -1067,11 +1092,12 @@ export async function startMcpHttpServer(
   // HTTP transport resolves the real database path, without leaking state into
   // callers that only import this module for its exports (e.g. tests).
   enableProductionMode();
-  const configPath = getConfigPath();
-  const store = await createStore({
-    dbPath: options.dbPath ?? getDefaultDbPath(),
-    ...(existsSync(configPath) ? { configPath } : {}),
-  });
+  let ownedStore: QMDStore | undefined;
+  let ownedHttpServer: import("http").Server | undefined;
+  let ownedMcpHandler: ReturnType<typeof createMcpHandler> | undefined;
+  try {
+    const store = await buildApprovedStore(options);
+    ownedStore = store;
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
@@ -1083,6 +1109,7 @@ export async function startMcpHttpServer(
     () => createMcpServer(store),
     { responseMode: "json" },
   );
+  ownedMcpHandler = mcpHandler;
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
@@ -1414,6 +1441,8 @@ export async function startMcpHttpServer(
       nodeRes.end("Internal Server Error");
     }
   });
+  ownedHttpServer = httpServer;
+  ownedMcpHandler = mcpHandler;
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
@@ -1449,6 +1478,12 @@ export async function startMcpHttpServer(
     log(`Warning: bound to ${host} with no QMD_ALLOWED_HOSTS — Host validation is off and the index is readable by anyone who can reach this port.`);
   }
   return { httpServer, port: actualPort, stop };
+  } catch (error) {
+    if (ownedMcpHandler) { try { await ownedMcpHandler.close(); } catch { /* optional dispose */ } }
+    if (ownedHttpServer) { try { ownedHttpServer.close(); } catch { /* ignore */ } }
+    if (ownedStore) { try { await ownedStore.close(); } catch { /* preserve primary */ } }
+    throw error;
+  }
 }
 
 // Run if this is the main module

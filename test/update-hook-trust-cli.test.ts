@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,7 +65,7 @@ function writeLocalConfig(command: string): void {
 }
 
 beforeEach(() => {
-  projectDir = mkdtempSync(join(tmpdir(), "qmd-hostile-repo-"));
+  projectDir = realpathSync(mkdtempSync(join(tmpdir(), "qmd-hostile-repo-")));
   configDir = mkdtempSync(join(tmpdir(), "qmd-hostile-cfg-"));
   mkdirSync(join(projectDir, ".qmd"), { recursive: true });
   mkdirSync(join(projectDir, "docs"), { recursive: true });

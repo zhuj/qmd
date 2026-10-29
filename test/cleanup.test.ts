@@ -131,7 +131,7 @@ describe("qmd cleanup vector repack", () => {
         const hash = hashOf(prefix, i);
         insertContent(s.db, hash, `body ${hash}`, now);
         insertDocument(s.db, collection, `${hash}.md`, hash, hash, now, now);
-        s.insertEmbedding(hash, 0, 0, new Float32Array([1, i * 0.001, 0]), "test-model", now, 1);
+        s.insertEmbedding(hash, 0, 0, new Float32Array([1, i * 0.001, 0]), "hf:example/test-model/test.gguf", now, 1);
       }
       const kept = new Set(keep.map((i) => hashOf(prefix, i)));
       const rows = s.db.prepare(`SELECT vr.id, vr.hash FROM ${VEC_ROWS_TABLE} vr JOIN vector_collection_ids ci ON ci.id = vr.collection_id WHERE ci.name = ?`).all(collection) as { id: number; hash: string }[];
@@ -229,7 +229,7 @@ describe("qmd cleanup vector repack", () => {
         const hash = `orphan${String(i).padStart(5, "0")}`;
         insertContent(s.db, hash, `body ${hash}`, now);
         insertDocument(s.db, "docs", `${hash}.md`, hash, hash, now, now);
-        s.insertEmbedding(hash, 0, 0, new Float32Array([1, i * 0.001, 0]), "test-model", now, 1);
+        s.insertEmbedding(hash, 0, 0, new Float32Array([1, i * 0.001, 0]), "hf:example/test-model/test.gguf", now, 1);
       }
     })();
     for (let i = 0; i < 2048; i += 2) deactivateDocument(s.db, "docs", `orphan${String(i).padStart(5, "0")}.md`);
@@ -256,9 +256,9 @@ describe("qmd cleanup vector repack", () => {
     expect(runCleanup(s.db).vectorsRepacked).toBe(false);
     expect(partitionCount(s, "alpha")).toBe(3);
     expect(partitionCount(s, "beta")).toBe(3);
-    const alpha = await searchVec(s.db, "ignored", "test-model", 5, "alpha", undefined, [1, 0, 0]);
+    const alpha = await searchVec(s.db, "ignored", "hf:example/test-model/test.gguf", 5, "alpha", undefined, [1, 0, 0]);
     expect(alpha.map((r) => r.hash).sort()).toEqual(["alpha00000", "alpha00001", "alpha01099"]);
-    const beta = await searchVec(s.db, "ignored", "test-model", 5, "beta", undefined, [1, 0, 0]);
+    const beta = await searchVec(s.db, "ignored", "hf:example/test-model/test.gguf", 5, "beta", undefined, [1, 0, 0]);
     expect(beta.map((r) => r.hash).sort()).toEqual(["beta00000", "beta00001", "beta01099"]);
   });
 
@@ -341,7 +341,7 @@ describe("qmd cleanup vector repack", () => {
     insertContent(s.db, "sharedhash", "body sharedhash", now);
     insertDocument(s.db, "alpha", "shared.md", "shared", "sharedhash", now, now);
     insertDocument(s.db, "beta", "shared.md", "shared", "sharedhash", now, now);
-    s.insertEmbedding("sharedhash", 0, 0, new Float32Array([1, 0, 0]), "test-model", now, 1);
+    s.insertEmbedding("sharedhash", 0, 0, new Float32Array([1, 0, 0]), "hf:example/test-model/test.gguf", now, 1);
     expect(partitionCount(s, "alpha")).toBe(1);
     expect(partitionCount(s, "beta")).toBe(1);
     deactivateDocument(s.db, "beta", "shared.md");

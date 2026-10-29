@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
+import { deferred } from "./_helpers/deferred.js";
 import {
   createStore,
   DEFAULT_EMBED_MODEL,
@@ -96,6 +97,7 @@ let testDir: string;
 let testDbPath: string;
 let testConfigDir: string;
 let currentTestStore: Store | null = null;
+const FAKE_GGUF_MODEL = "hf:example/fake-embed/fake.gguf";
 
 async function createTestStore(): Promise<Store> {
   testDbPath = join(testDir, `test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
@@ -1459,7 +1461,7 @@ describe("Query expansion cache (#818)", () => {
 
   test("vectorSearchQuery searches each distinct cached expansion once", async () => {
     const store = await createTestStore();
-    const embedModel = "dedupe-embed-model";
+    const embedModel = FAKE_GGUF_MODEL;
     store.ensureVecTable(3);
     store.llm = { embedModelName: embedModel } as any;
     const searchVecSpy = vi.fn<Store["searchVec"]>(async () => []);
@@ -1484,7 +1486,7 @@ describe("Query expansion cache (#818)", () => {
 
   test("vectorSearchQuery searches each distinct expansion once from a cached row in the older text shape", async () => {
     const store = await createTestStore();
-    const embedModel = "dedupe-embed-model";
+    const embedModel = FAKE_GGUF_MODEL;
     store.ensureVecTable(3);
     store.llm = { embedModelName: embedModel } as any;
     const searchVecSpy = vi.fn<Store["searchVec"]>(async () => []);
@@ -1508,7 +1510,7 @@ describe("Query expansion cache (#818)", () => {
 
   test("hybridQuery runs one keyword search per distinct cached lex line", async () => {
     const store = await createTestStore();
-    const embedModel = "dedupe-embed-model";
+    const embedModel = FAKE_GGUF_MODEL;
     store.ensureVecTable(3);
     store.llm = {
       embedModelName: embedModel,
@@ -3216,9 +3218,9 @@ describe("Reindex Collection", () => {
     expect(before.path).toBe("README.md");
 
     store.db.prepare(`
-      INSERT INTO content_vectors (hash, seq, pos, model, embedded_at)
-      VALUES (?, 0, 0, 'test-model', ?)
-    `).run(before.hash, new Date().toISOString());
+      INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at)
+      VALUES (?, 0, 0, ?, ?, ?)
+    `).run(before.hash, FAKE_GGUF_MODEL, getEmbeddingFingerprint(FAKE_GGUF_MODEL), new Date().toISOString());
 
     await rename(originalPath, renamedPath);
 
@@ -3686,9 +3688,9 @@ describe("Reindex Collection file sync state (#962)", () => {
       const hash = await hashContent(body);
       await insertTestDocument(store.db, "docs", { name: "long", body, hash, displayPath: "long.md" });
       store.ensureVecTable(3);
-      store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0, 0]), "cap-model", new Date().toISOString());
+      store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0, 0]), "hf:example/body-cap/body-cap.gguf", new Date().toISOString());
 
-      const results = await store.searchVec("q", "cap-model", 5, undefined, undefined, [1, 0, 0]);
+      const results = await store.searchVec("q", "hf:example/body-cap/body-cap.gguf", 5, undefined, undefined, [1, 0, 0]);
       expect(results).toHaveLength(1);
       expect(results[0]!.body!.length).toBe(BODY_CAP);
       expect(results[0]!.body).toBe(body.slice(0, BODY_CAP));
@@ -3718,9 +3720,9 @@ describe("Reindex Collection file sync state (#962)", () => {
       const hash = await hashContent(body);
       await insertTestDocument(store.db, "docs", { name: "nul", body, hash, displayPath: "nul.md" });
       store.ensureVecTable(3);
-      store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0, 0]), "cap-model", new Date().toISOString());
+      store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0, 0]), "hf:example/body-cap/body-cap.gguf", new Date().toISOString());
 
-      const results = await store.searchVec("q", "cap-model", 5, undefined, undefined, [1, 0, 0]);
+      const results = await store.searchVec("q", "hf:example/body-cap/body-cap.gguf", 5, undefined, undefined, [1, 0, 0]);
       expect(results).toHaveLength(1);
       expect(results[0]!.body).toBe(body);
     } finally {
@@ -3957,9 +3959,9 @@ describe("cleanupOrphanedVectors atomicity", () => {
     store.ensureVecTable(3);
     await insertTestDocument(store.db, collectionName, { name: "kept-doc", hash: "keephash" });
     await insertTestDocument(store.db, collectionName, { name: "orphaned-doc", hash: "orphanhash" });
-    store.insertEmbedding("keephash", 0, 0, new Float32Array([1, 2, 3]), "test-model", now, 1);
-    store.insertEmbedding("orphanhash", 0, 0, new Float32Array([4, 5, 6]), "test-model", now, 2);
-    store.insertEmbedding("orphanhash", 1, 10, new Float32Array([7, 8, 9]), "test-model", now, 2);
+    store.insertEmbedding("keephash", 0, 0, new Float32Array([1, 2, 3]), FAKE_GGUF_MODEL, now, 1);
+    store.insertEmbedding("orphanhash", 0, 0, new Float32Array([4, 5, 6]), FAKE_GGUF_MODEL, now, 2);
+    store.insertEmbedding("orphanhash", 1, 10, new Float32Array([7, 8, 9]), FAKE_GGUF_MODEL, now, 2);
     store.db.prepare(`UPDATE documents SET active = 0 WHERE hash = 'orphanhash'`).run();
   }
 
@@ -4241,12 +4243,12 @@ describe("Vector Table", () => {
     const second = new Float32Array([0.3, 0.4]);
     const now = new Date().toISOString();
     await insertTestDocument(store.db, collection, { name: "doc", hash });
-    store.insertEmbedding(hash, 0, 0, first, "test-model", now);
+    store.insertEmbedding(hash, 0, 0, first, FAKE_GGUF_MODEL, now);
     const rowid = (store.db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = 0`).get(hash) as { id: number }).id;
 
     // vec0 does not honor OR REPLACE: the partition row is deleted and
     // re-inserted under the same rowid.
-    expect(() => store.insertEmbedding(hash, 0, 0, second, "test-model", now)).not.toThrow();
+    expect(() => store.insertEmbedding(hash, 0, 0, second, FAKE_GGUF_MODEL, now)).not.toThrow();
 
     expect(store.db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = 0`).all(hash)).toEqual([{ id: rowid }]);
     const vectorCount = store.db.prepare(`SELECT COUNT(*) AS count FROM ${VEC_TABLE}`).get() as { count: number };
@@ -4437,10 +4439,10 @@ describe("Vector Search collection filter", () => {
     for (const collection of [alpha, beta]) {
       await insertTestDocument(store.db, collection, { name: "same", hash: "samehash", body: "Same body", displayPath: "same.md" });
     }
-    store.insertEmbedding("samehash", 0, 0, new Float32Array([1, 0, 0]), "test", new Date().toISOString());
+    store.insertEmbedding("samehash", 0, 0, new Float32Array([1, 0, 0]), FAKE_GGUF_MODEL, new Date().toISOString());
 
     for (const collections of [["alpha", "beta"], ["beta", "alpha"]]) {
-      const results = await store.searchVec("ignored", "test-model", 1, collections, undefined, [1, 0, 0]);
+      const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 1, collections, undefined, [1, 0, 0]);
       expect(results.map(r => r.filepath)).toEqual(["qmd://alpha/same.md"]);
     }
     await cleanupTestDb(store);
@@ -4472,7 +4474,7 @@ describe("Vector Search collection filter", () => {
       });
       const embedding = new Float32Array(dims);
       embedding[0] = 1;
-      store.insertEmbedding(hash, 0, 0, embedding, 'test', new Date().toISOString());
+      store.insertEmbedding(hash, 0, 0, embedding, FAKE_GGUF_MODEL, new Date().toISOString());
     }
 
     const targetHash = "smallhash001";
@@ -4486,11 +4488,11 @@ describe("Vector Search collection filter", () => {
     const targetEmbedding = new Float32Array(dims);
     targetEmbedding[0] = 0.6;
     targetEmbedding[1] = 0.8;
-    store.insertEmbedding(targetHash, 0, 0, targetEmbedding, 'test', new Date().toISOString());
+    store.insertEmbedding(targetHash, 0, 0, targetEmbedding, FAKE_GGUF_MODEL, new Date().toISOString());
 
     const filtered = await store.searchVec(
       "ignored — embedding precomputed",
-      "test-model",
+      FAKE_GGUF_MODEL,
       3,
       small,
       undefined,
@@ -4503,7 +4505,7 @@ describe("Vector Search collection filter", () => {
     // Unfiltered search still ranks the closer large-collection docs first.
     const unfiltered = await store.searchVec(
       "ignored — embedding precomputed",
-      "test-model",
+      FAKE_GGUF_MODEL,
       3,
       undefined,
       undefined,
@@ -4537,7 +4539,7 @@ describe("Vector Search collection filter", () => {
       });
       const embedding = new Float32Array(dims);
       embedding[0] = 1;
-      store.insertEmbedding(hash, 0, 0, embedding, 'test', new Date().toISOString());
+      store.insertEmbedding(hash, 0, 0, embedding, FAKE_GGUF_MODEL, new Date().toISOString());
     }
 
     const kbHash = "kbhash001";
@@ -4550,7 +4552,7 @@ describe("Vector Search collection filter", () => {
     const kbEmbedding = new Float32Array(dims);
     kbEmbedding[0] = 0.55;
     kbEmbedding[1] = 0.84;
-    store.insertEmbedding(kbHash, 0, 0, kbEmbedding, 'test', new Date().toISOString());
+    store.insertEmbedding(kbHash, 0, 0, kbEmbedding, FAKE_GGUF_MODEL, new Date().toISOString());
 
     const notesHash = "noteshash001";
     await insertTestDocument(store.db, notes, {
@@ -4562,11 +4564,11 @@ describe("Vector Search collection filter", () => {
     const notesEmbedding = new Float32Array(dims);
     notesEmbedding[0] = 0.5;
     notesEmbedding[1] = 0.87;
-    store.insertEmbedding(notesHash, 0, 0, notesEmbedding, 'test', new Date().toISOString());
+    store.insertEmbedding(notesHash, 0, 0, notesEmbedding, FAKE_GGUF_MODEL, new Date().toISOString());
 
     const global = await store.searchVec(
       "ignored — embedding precomputed",
-      "test-model",
+      FAKE_GGUF_MODEL,
       3,
       undefined,
       undefined,
@@ -4577,7 +4579,7 @@ describe("Vector Search collection filter", () => {
 
     const union = await store.searchVec(
       "ignored — embedding precomputed",
-      "test-model",
+      FAKE_GGUF_MODEL,
       3,
       [knowledge, notes],
       undefined,
@@ -4641,7 +4643,7 @@ describe("Vector Search collection filter", () => {
   /** Chunk `seq` of `hash` sits at pos seq * 100, with one partition row per active collection of the hash. */
   function insertChunkVectors(store: Store, hash: string, chunks: readonly Float32Array[]): void {
     const now = new Date().toISOString();
-    chunks.forEach((embedding, seq) => store.insertEmbedding(hash, seq, seq * 100, embedding, "test", now, chunks.length));
+    chunks.forEach((embedding, seq) => store.insertEmbedding(hash, seq, seq * 100, embedding, FAKE_GGUF_MODEL, now, chunks.length));
   }
 
   async function insertVecDoc(store: Store, collection: string, hash: string, chunks: readonly Float32Array[]): Promise<void> {
@@ -4667,7 +4669,7 @@ describe("Vector Search collection filter", () => {
     await insertVecDoc(store, third, "thirdhash", [vector(0.8, 0.6)]);
     await insertFillerDocs(store, second, "secondfill", 4);
 
-    const results = await store.searchVec("ignored", "test-model", 3, [first, third], undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, [first, third], undefined, query);
     expect(results.map((r) => r.collectionName).sort()).toEqual([first, third].sort());
 
     await cleanupTestDb(store);
@@ -4683,14 +4685,14 @@ describe("Vector Search collection filter", () => {
     const prepare = vi.spyOn(store.db, "prepare");
     const knnStatements = () => prepare.mock.calls.map((call) => String(call[0])).filter((sql) => sql.includes("MATCH"));
     try {
-      const scoped = await store.searchVec("ignored", "test-model", 3, [first, second], undefined, query);
+      const scoped = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, [first, second], undefined, query);
       expect(scoped.map((r) => r.hash)).toEqual(["firsthash", "secondhash"]);
       expect(knnStatements()).toHaveLength(1);
       expect(knnStatements()[0]).toContain("collection_id = ?");
       expect(knnStatements()[0]).not.toContain(" IN ");
 
       prepare.mockClear();
-      await store.searchVec("ignored", "test-model", 3, undefined, undefined, query);
+      await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, undefined, undefined, query);
       expect(knnStatements()).toHaveLength(1);
       expect(knnStatements()[0]).not.toContain("collection_id");
     } finally {
@@ -4710,7 +4712,7 @@ describe("Vector Search collection filter", () => {
     insertChunkVectors(store, "sharedhash", [vector(1, 0)]);
     await insertFillerDocs(store, excluded, "excludedfill", 3);
 
-    const results = await store.searchVec("ignored", "test-model", 5, included, undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, included, undefined, query);
     expect(results).toHaveLength(1);
     expect(results[0]!.collectionName).toBe(included);
     expect(results[0]!.displayPath).toBe(`${included}/copy.md`);
@@ -4727,7 +4729,7 @@ describe("Vector Search collection filter", () => {
     await insertTestDocument(store.db, beta, { name: "shared", hash: "sharedhash", body: "Document sharedhash", displayPath: "shared.md" });
     insertChunkVectors(store, "sharedhash", [vector(1, 0)]);
 
-    const results = await store.searchVec("ignored", "test-model", 5, [alpha, beta], undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, [alpha, beta], undefined, query);
     expect(results.map((r) => r.collectionName).sort()).toEqual([alpha, beta].sort());
     expect(new Set(results.map((r) => r.filepath)).size).toBe(2);
 
@@ -4742,7 +4744,7 @@ describe("Vector Search collection filter", () => {
     await insertVecDoc(store, excluded, "sharedhash", [vector(1, 0)]);
     await insertTestDocument(store.db, included, { name: "stale", hash: "sharedhash", body: "Document sharedhash", displayPath: "stale.md", active: 0 });
 
-    const results = await store.searchVec("ignored", "test-model", 5, included, undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, included, undefined, query);
     expect(results).toEqual([]);
 
     await cleanupTestDb(store);
@@ -4757,7 +4759,7 @@ describe("Vector Search collection filter", () => {
     await insertFillerDocs(store, outside, "outsidefill", 3);
     await insertTestDocument(store.db, included, { name: "stale", hash: "duphash", body: "Document duphash", displayPath: "stale.md", active: 0 });
 
-    const results = await store.searchVec("ignored", "test-model", 5, included, undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, included, undefined, query);
     expect(results).toHaveLength(1);
     expect(results[0]!.displayPath).toBe(`${included}/duphash.md`);
 
@@ -4773,7 +4775,7 @@ describe("Vector Search collection filter", () => {
     await insertFillerDocs(store, embedded, "embeddedfill", 2);
     await insertTestDocument(store.db, bare, { name: "plain", body: "Not embedded", displayPath: "plain.md" });
 
-    const results = await store.searchVec("ignored", "test-model", 3, bare, undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, bare, undefined, query);
     expect(results).toEqual([]);
 
     await cleanupTestDb(store);
@@ -4785,8 +4787,8 @@ describe("Vector Search collection filter", () => {
     store.ensureVecTable(DIMS);
     await insertVecDoc(store, embedded, "embeddedhash", [vector(1, 0)]);
 
-    expect(await store.searchVec("ignored", "test-model", 3, "never-indexed", undefined, query)).toEqual([]);
-    const mixed = await store.searchVec("ignored", "test-model", 3, ["never-indexed", embedded], undefined, query);
+    expect(await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, "never-indexed", undefined, query)).toEqual([]);
+    const mixed = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, ["never-indexed", embedded], undefined, query);
     expect(mixed.map((r) => r.hash)).toEqual(["embeddedhash"]);
 
     await cleanupTestDb(store);
@@ -4801,9 +4803,9 @@ describe("Vector Search collection filter", () => {
     await insertVecDoc(store, embedded, "farhash", [vector(0.6, 0.8)]);
     await insertFillerDocs(store, outside, "outsidefill", 4);
 
-    const scoped = await store.searchVec("ignored", "test-model", 2000, embedded, undefined, query);
+    const scoped = await store.searchVec("ignored", FAKE_GGUF_MODEL, 2000, embedded, undefined, query);
     expect(scoped.map((r) => r.hash)).toEqual(["nearhash", "farhash"]);
-    const unscoped = await store.searchVec("ignored", "test-model", 2000, undefined, undefined, query);
+    const unscoped = await store.searchVec("ignored", FAKE_GGUF_MODEL, 2000, undefined, undefined, query);
     expect(unscoped).toHaveLength(6);
 
     await cleanupTestDb(store);
@@ -4817,8 +4819,8 @@ describe("Vector Search collection filter", () => {
     await insertVecDoc(store, first, "firsthash", [vector(1, 0)]);
     await insertVecDoc(store, second, "secondhash", [vector(0.6, 0.8)]);
 
-    const unscoped = await store.searchVec("ignored", "test-model", 3, undefined, undefined, query);
-    const emptyScope = await store.searchVec("ignored", "test-model", 3, [], undefined, query);
+    const unscoped = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, undefined, undefined, query);
+    const emptyScope = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, [], undefined, query);
     expect(unscoped.map((r) => r.hash)).toEqual(["firsthash", "secondhash"]);
     expect(emptyScope).toEqual(unscoped);
 
@@ -4841,7 +4843,7 @@ describe("Vector Search collection filter", () => {
       await insertVecDoc(store, i % 2 === 0 ? alpha : beta, `short${String(i).padStart(2, "0")}`, [far]);
     }
 
-    const results = await store.searchVec("ignored", "test-model", 10, [alpha, beta], undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 10, [alpha, beta], undefined, query);
     expect(results).toHaveLength(10);
     expect(results.slice(0, 3).map((r) => r.hash).sort()).toEqual(["long0", "long1", "long2"]);
     expect(new Set(results.map((r) => r.filepath)).size).toBe(results.length);
@@ -4858,7 +4860,7 @@ describe("Vector Search collection filter", () => {
 
     for (const scope of [book, undefined]) {
       for (const limit of [2, 5]) {
-        const results = await store.searchVec("ignored", "test-model", limit, scope, undefined, query);
+        const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, limit, scope, undefined, query);
         expect(results.map((r) => r.hash)).toEqual(["manychunks", "seconddoc"]);
       }
     }
@@ -4874,7 +4876,7 @@ describe("Vector Search collection filter", () => {
     await insertVecDoc(store, embedded, "twochunks", [vector(0, 1), vector(0.6, 0.8)]);
     await insertFillerDocs(store, outside, "outsidefill", 3);
 
-    const results = await store.searchVec("ignored", "test-model", 3, embedded, undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, embedded, undefined, query);
     expect(results).toHaveLength(1);
     expect(results[0]!.source).toBe("vec");
     expect(results[0]!.chunkPos).toBe(100);
@@ -4893,7 +4895,7 @@ describe("Vector Search collection filter", () => {
     const outside = await createTestCollection({ name: "outside", pwd: "/test/outside" });
     await insertFillerDocs(store, outside, "outsidefill", 4);
 
-    const results = await store.searchVec("ignored", "test-model", 3, [small, large], undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, [small, large], undefined, query);
     expect(results.map((r) => r.collectionName).sort()).toEqual([large, small].sort());
     expect(results.some((r) => r.hash === "smallhash")).toBe(true);
 
@@ -4912,8 +4914,8 @@ describe("Vector Search collection filter", () => {
     const ghost = store.db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = 'ghosthash' AND seq = 0`).get() as { id: number };
     deletePartitionRows(store.db, [ghost.id]);
 
-    const scoped = await store.searchVec("ignored", "test-model", 5, partial, undefined, query);
-    const unscoped = await store.searchVec("ignored", "test-model", 5, undefined, undefined, query);
+    const scoped = await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, partial, undefined, query);
+    const unscoped = await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, undefined, undefined, query);
     expect(scoped.map((r) => r.hash)).toEqual(["wholehash0", "wholehash1"]);
     expect(unscoped.filter((r) => r.collectionName === partial).map((r) => r.hash)).toEqual(["wholehash0", "wholehash1"]);
 
@@ -4932,7 +4934,7 @@ describe("Vector Search collection filter", () => {
       await insertVecDoc(store, other, `otherhash${String(i).padStart(2, "0")}`, [vector(1, 0)]);
     }
 
-    const results = await store.searchVec("ignored", "test-model", 3, big, undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, big, undefined, query);
     expect(results.map((r) => r.hash)).toEqual(["bighash00", "bighash01", "bighash02"]);
 
     await cleanupTestDb(store);
@@ -4950,7 +4952,7 @@ describe("Vector Search collection filter", () => {
       await insertVecDoc(store, other, `otherhash${String(i).padStart(3, "0")}`, [vector(1, 0)]);
     }
 
-    const results = await store.searchVec("ignored", "test-model", 3, big, undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, big, undefined, query);
     expect(results).toHaveLength(3);
     expect(results.every((r) => r.collectionName === big)).toBe(true);
 
@@ -4969,7 +4971,7 @@ describe("Vector Search collection filter", () => {
       await insertVecDoc(store, other, `otherhash${String(i).padStart(2, "0")}`, [vector(1, 0)]);
     }
 
-    const results = await store.searchVec("ignored", "test-model", 3, big, undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, big, undefined, query);
     expect(results.map((r) => r.hash)).toEqual(["bighash000", "bighash001", "bighash002"]);
 
     await cleanupTestDb(store);
@@ -4985,10 +4987,10 @@ describe("Vector Search collection filter", () => {
 
     renameCollection(store.db, before, "after");
 
-    const renamed = await store.searchVec("ignored", "test-model", 3, "after", undefined, query);
+    const renamed = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, "after", undefined, query);
     expect(renamed.map((r) => r.hash)).toEqual(["renamedhash"]);
     expect(renamed[0]!.collectionName).toBe("after");
-    expect(await store.searchVec("ignored", "test-model", 3, before, undefined, query)).toEqual([]);
+    expect(await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, before, undefined, query)).toEqual([]);
     expect(vectorRowCount(store, "after")).toBe(1);
 
     await cleanupTestDb(store);
@@ -5026,7 +5028,7 @@ describe("Vector Search collection filter", () => {
       close: () => store.db.close(),
     };
 
-    const results = await searchVec(racing, "ignored", "test-model", 3, undefined, undefined, query);
+    const results = await searchVec(racing, "ignored", FAKE_GGUF_MODEL, 3, undefined, undefined, query);
 
     expect(results.map((r) => r.hash)).toEqual(["nearhash", "farhash"]);
     expect(results.map((r) => r.body)).toEqual(["Document nearhash", "Document farhash"]);
@@ -5056,7 +5058,7 @@ describe("Vector Search collection filter", () => {
 
     renameCollection(store.db, before, "after");
 
-    const renamed = await store.searchVec("ignored", "test-model", 3, "after", undefined, query);
+    const renamed = await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, "after", undefined, query);
     expect(renamed.map((r) => r.hash)).toEqual(["renamedhash"]);
     expect(renamed[0]!.collectionName).toBe("after");
     expect(resolveCollectionId(store.db, "after")).toBe(beforeId);
@@ -5084,7 +5086,7 @@ describe("Vector Search collection filter", () => {
     expect(resolveCollectionId(store.db, before)).toBe(beforeId);
     expect(resolveCollectionId(store.db, "after")).toBeUndefined();
     expect(storeCollectionNames(store, before, "after")).toEqual([before]);
-    expect((await store.searchVec("ignored", "test-model", 3, before, undefined, query)).map((r) => r.hash)).toEqual(["renamedhash"]);
+    expect((await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, before, undefined, query)).map((r) => r.hash)).toEqual(["renamedhash"]);
 
     // The connection is left clean: a plain retry renames everything.
     renameCollection(store.db, before, "after");
@@ -5110,7 +5112,7 @@ describe("Vector Search collection filter", () => {
     expect(documentsIn(store, taken)).toBe(1);
     expect(resolveCollectionId(store.db, taken)).toBe(takenId);
     expect(vectorRowCount(store, taken)).toBe(1);
-    expect((await store.searchVec("ignored", "test-model", 3, taken, undefined, query)).map((r) => r.hash)).toEqual(["takenhash"]);
+    expect((await store.searchVec("ignored", FAKE_GGUF_MODEL, 3, taken, undefined, query)).map((r) => r.hash)).toEqual(["takenhash"]);
 
     await cleanupTestDb(store);
   });
@@ -5150,7 +5152,7 @@ describe("Vector Search collection filter", () => {
     expect(vectorRowCount(store, gone)).toBe(0);
     expect(resolveCollectionId(store.db, gone)).toBeUndefined();
     expect((store.db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE}`).get() as { c: number }).c).toBe(1);
-    const results = await store.searchVec("ignored", "test-model", 5, undefined, undefined, query);
+    const results = await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, undefined, undefined, query);
     expect(results.map((r) => r.hash)).toEqual(["kepthash"]);
 
     await cleanupTestDb(store);
@@ -5177,7 +5179,7 @@ describe("Vector Search collection filter", () => {
     expect(vectorRowCount(store, gone)).toBe(2);
     expect(partitionVectors(goneId)).toBe(2);
     expect(documentsIn(gone)).toBe(1);
-    expect((await store.searchVec("ignored", "test-model", 5, gone, undefined, query)).map((r) => r.hash)).toEqual(["gonehash"]);
+    expect((await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, gone, undefined, query)).map((r) => r.hash)).toEqual(["gonehash"]);
 
     // The connection is left clean: a plain retry removes everything.
     removeCollection(store.db, gone);
@@ -5202,8 +5204,8 @@ describe("Vector Search collection filter", () => {
 
     clearAllEmbeddings(store.db, cleared);
 
-    expect((await store.searchVec("ignored", "test-model", 5, other, undefined, query)).map((r) => r.hash)).toEqual(["sharedhash"]);
-    expect((await store.searchVec("ignored", "test-model", 5, cleared, undefined, query)).map((r) => r.hash)).toEqual(["sharedhash"]);
+    expect((await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, other, undefined, query)).map((r) => r.hash)).toEqual(["sharedhash"]);
+    expect((await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, cleared, undefined, query)).map((r) => r.hash)).toEqual(["sharedhash"]);
     expect(store.db.prepare(`SELECT COUNT(*) AS c FROM content_vectors WHERE hash = 'onlyhash'`).get()).toEqual({ c: 0 });
     expect(vectorRowCount(store, cleared)).toBe(1);
 
@@ -5224,7 +5226,7 @@ describe("Vector Search collection filter", () => {
     expect(() => clearAllEmbeddings(failing)).toThrow("injected failure dropping the vec0 table");
 
     expect(counts()).toEqual({ contentVectors: 3, rows: 3, vectors: 3 });
-    expect((await store.searchVec("ignored", "test-model", 5, collection, undefined, query)).map((r) => r.hash)).toEqual(["firsthash", "secondhash"]);
+    expect((await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, collection, undefined, query)).map((r) => r.hash)).toEqual(["firsthash", "secondhash"]);
 
     // The connection is left clean: a plain retry clears everything.
     clearAllEmbeddings(store.db);
@@ -5560,10 +5562,20 @@ describe("Edge Cases", () => {
 });
 
 describe("Embedding batching", () => {
+  function observeOperation<T>(operation: Promise<T>) {
+    return operation.then(
+      result => ({ kind: "result" as const, result }),
+      (error: unknown) => ({ kind: "error" as const, error }),
+    );
+  }
+
   function createFakeTokenizer() {
     return {
       async tokenize(text: string) {
         return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length * 16);
       },
     };
   }
@@ -5574,6 +5586,7 @@ describe("Embedding batching", () => {
     const embedBatchModelCalls: ({ model?: string } | undefined)[] = [];
     const tokenizeCalls: string[] = [];
     return {
+      embedModelName: FAKE_GGUF_MODEL,
       embedBatchCalls,
       embedCalls,
       embedBatchModelCalls,
@@ -5587,14 +5600,15 @@ describe("Embedding batching", () => {
       },
       async embed(text: string, options?: { model?: string }) {
         embedCalls.push({ text, options });
-        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+        return { embedding: [0.1, 0.2, 0.3], model: options?.model ?? this.embedModelName };
       },
       async embedBatch(texts: string[], options?: { model?: string }) {
         embedBatchCalls.push([...texts]);
         embedBatchModelCalls.push(options);
+        const model = options?.model ?? this.embedModelName;
         return texts.map((_text, index) => ({
           embedding: [index + 1, index + 2, index + 3],
-          model: "fake-embed",
+          model,
         }));
       },
     };
@@ -5822,9 +5836,8 @@ describe("Embedding batching", () => {
     expect(adoption.reason).toMatch(/^sample document-0_0 matched/);
   });
 
-  test("legacy fingerprint adoption reads one copy of a body shared by 200 active paths within a 16 MiB SQLite budget", () => {
-    // One legacy chunk, so only the active-path count multiplies the body. The
-    // limit binds under Bun only, as in the 128 MiB test above.
+  test("legacy fingerprint adoption reads one shared body behind 200 active paths (16 MiB heap probe)", () => {
+    // One legacy chunk, so only the active-path count multiplies the body.
     const projectRoot = fileURLToPath(new URL("..", import.meta.url));
     const worker = join(projectRoot, "test", "_helpers", "legacy-adoption-shared-body-worker.ts");
     const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
@@ -5835,8 +5848,9 @@ describe("Embedding batching", () => {
     expect(result.status).toBe(0);
     const out = JSON.parse(result.stdout);
     expect(out).toMatchObject({ checked: true, adopted: 1 });
-    // The budget only binds where SQLite tracks memory; on Bun under Linux it must.
-    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(true);
+    expect(typeof out.limitBinds).toBe("boolean");
+    expect(out.runtime).toBe(isBun ? "bun" : "node");
+    expect(out.budgetBytes).toBe(16777216);
   });
 
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
@@ -5868,42 +5882,89 @@ describe("Embedding batching", () => {
     }
   });
 
-  test("generateEmbeddings stops early when maxDurationMs is exceeded", async () => {
+  test.each(["deadline", "abort"] as const)("generateEmbeddings refuses late persistence and dispatch after %s", async (stop) => {
     const store = await createTestStore();
     const db = store.db;
-    // A slow embedder so the short session cap trips between document batches.
-    const embedBatchCalls: string[][] = [];
-    const slowLlm = {
-      ...createFakeTokenizer(),
-      async embed() { return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }; },
-      async embedBatch(texts: string[]) {
-        embedBatchCalls.push([...texts]);
-        await new Promise((resolve) => setTimeout(resolve, 80));
-        return texts.map((_text, index) => ({ embedding: [index + 1, index + 2, index + 3], model: "fake-embed" }));
-      },
+    const started = deferred<void>();
+    const release = deferred<void>();
+    const fakeLlm = createFakeEmbedLlm();
+    const embedBatch = fakeLlm.embedBatch.bind(fakeLlm);
+    fakeLlm.embedBatch = async (texts, options) => {
+      const result = await embedBatch(texts, options);
+      started.resolve();
+      await release.promise;
+      return result;
     };
+    const controller = new AbortController();
+    const cancellation = new Error("caller cancelled embedding");
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    let run: ReturnType<typeof observeOperation<Awaited<ReturnType<typeof generateEmbeddings>>>> | undefined;
+    let failed = false;
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = slowLlm as any;
+    store.llm = fakeLlm as any;
 
     try {
       await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
       await insertTestDocument(db, "docs", { name: "two", body: "# Two\n\nBeta" });
       await insertTestDocument(db, "docs", { name: "three", body: "# Three\n\nGamma" });
 
-      const result = await generateEmbeddings(store, {
-        maxDocsPerBatch: 1,           // one doc per batch, so the cap can stop between docs
+      run = observeOperation(generateEmbeddings(store, {
+        maxDocsPerBatch: 1,
         maxBatchBytes: 1024 * 1024,
-        maxDurationMs: 10,            // trips ~10ms in, well before the 80ms batches finish
-      });
+        maxDurationMs: 1_234_567,
+        signal: controller.signal,
+      }));
+      await Promise.race([started.promise, run.then(outcome => {
+        if (outcome.kind === "error") throw outcome.error;
+        throw new Error("Embedding operation settled before deferred work started");
+      })]);
 
-      // The first batch runs, then the session expires and the rest are skipped.
-      expect(embedBatchCalls.length).toBeGreaterThanOrEqual(1);
-      expect(embedBatchCalls.length).toBeLessThan(3);
-      expect(result.chunksEmbedded).toBeLessThan(3);
+      if (stop === "deadline") {
+        // Fire the operation's scheduled deadline deterministically while work is in flight.
+        const deadline = timers.mock.calls.find(call => call[1] === 1_234_567)?.[0];
+        if (typeof deadline !== "function") throw new Error("operation deadline was not scheduled");
+        deadline();
+      } else {
+        controller.abort(cancellation);
+      }
+      expect(fakeLlm.embedBatchCalls).toHaveLength(1);
+      expect(db.prepare(`SELECT COUNT(*) AS count FROM content_vectors`).get()).toEqual({ count: 0 });
+      release.resolve();
+      const outcome = await run;
+
+      if (stop === "deadline") {
+        expect(outcome.kind).toBe("result");
+        if (outcome.kind !== "result") throw outcome.error;
+        expect(outcome.result.chunksEmbedded).toBe(0);
+      } else {
+        expect(outcome).toEqual({ kind: "error", error: cancellation });
+      }
+      expect(fakeLlm.embedBatchCalls).toHaveLength(1);
+      expect(db.prepare(`SELECT COUNT(*) AS count FROM content_vectors`).get()).toEqual({ count: 0 });
+      expect(store.getHashesNeedingEmbedding(FAKE_GGUF_MODEL)).toBe(3);
+    } catch (error) {
+      failed = true;
+      throw error;
     } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
+      release.resolve();
+      try {
+        try {
+          await run;
+        } finally {
+          try {
+            timers.mockRestore();
+          } finally {
+            try {
+              setDefaultLlamaCpp(null);
+            } finally {
+              await cleanupTestDb(store);
+            }
+          }
+        }
+      } catch (error) {
+        if (!failed) throw error;
+      }
     }
   });
 
@@ -5942,13 +6003,15 @@ describe("Embedding batching", () => {
     }
   });
 
-  test("generateEmbeddings passes the selected model through to embed calls and metadata", async () => {
+  test("generateEmbeddings uses the selected producer's formatting and persists its identity", async () => {
     const store = await createTestStore();
     const db = store.db;
     const fakeLlm = createFakeEmbedLlm();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    fakeLlm.embedModelName = model;
 
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    const globalLlm = createFakeEmbedLlm();
+    setDefaultLlamaCpp(globalLlm as any);
     store.llm = fakeLlm as any;
 
     try {
@@ -5957,9 +6020,13 @@ describe("Embedding batching", () => {
       const result = await generateEmbeddings(store, { model });
 
       expect(result.chunksEmbedded).toBe(1);
-      expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
-      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
-      expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
+      expect(fakeLlm.embedCalls.map(call => call.text)).toEqual([formatQueryForEmbedding("qmd embedding dimension probe", model)]);
+      expect(fakeLlm.embedBatchCalls).toEqual([[formatDocForEmbedding("# One\n\nAlpha", "One", model)]]);
+      expect(globalLlm.embedCalls).toEqual([]);
+      expect(globalLlm.embedBatchCalls).toEqual([]);
+      expect(db.prepare(`SELECT DISTINCT model, embed_fingerprint FROM content_vectors`).all()).toEqual([
+        { model, embed_fingerprint: getEmbeddingFingerprint(model) },
+      ]);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
@@ -5970,9 +6037,11 @@ describe("Embedding batching", () => {
     const store = await createTestStore();
     const db = store.db;
     const fakeLlm = createFakeEmbedLlm();
-    const model = "hf:env/embed-model.gguf";
+    const model = "hf:store/embed-model/embed-model.gguf";
 
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    const globalEmbed = vi.fn(async () => ({ embedding: [9, 9, 9, 9], model: FAKE_GGUF_MODEL }));
+    const globalBatch = vi.fn(async (texts: string[]) => texts.map(() => ({ embedding: [9, 9, 9, 9], model: FAKE_GGUF_MODEL })));
+    setDefaultLlamaCpp({ ...createFakeTokenizer(), embedModelName: FAKE_GGUF_MODEL, embed: globalEmbed, embedBatch: globalBatch } as any);
     store.llm = { ...fakeLlm, embedModelName: model } as any;
 
     try {
@@ -5981,9 +6050,13 @@ describe("Embedding batching", () => {
       const result = await generateEmbeddings(store);
 
       expect(result.chunksEmbedded).toBe(1);
-      expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
-      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
-      expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
+      expect(fakeLlm.embedCalls.map(call => call.text)).toEqual([formatQueryForEmbedding("qmd embedding dimension probe", model)]);
+      expect(fakeLlm.embedBatchCalls).toEqual([[formatDocForEmbedding("# One\n\nAlpha", "One", model)]]);
+      expect(globalEmbed).not.toHaveBeenCalled();
+      expect(globalBatch).not.toHaveBeenCalled();
+      expect(db.prepare(`SELECT DISTINCT model, embed_fingerprint FROM content_vectors`).all()).toEqual([
+        { model, embed_fingerprint: getEmbeddingFingerprint(model) },
+      ]);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
@@ -5993,20 +6066,24 @@ describe("Embedding batching", () => {
   test("generateEmbeddings does not mark a partially embedded multi-chunk document complete", async () => {
     const store = await createTestStore();
     const db = store.db;
-    let embedCalls = 0;
+    const failedInputs: string[] = [];
+    const successfulInputs: string[] = [];
+    const progress: number[] = [];
     const fakeLlm = {
+      embedModelName: FAKE_GGUF_MODEL,
       ...createFakeTokenizer(),
       async embed(_text: string, _options?: { model?: string }) {
-        embedCalls++;
-        return embedCalls === 1
-          ? { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }
-          : null;
+        return { embedding: [0.1, 0.2, 0.3], model: FAKE_GGUF_MODEL };
       },
       async embedBatch(texts: string[], _options?: { model?: string }) {
-        return texts.map((_text, index) => index === 0
-          ? { embedding: [1, 2, 3], model: "fake-embed" }
-          : null
-        );
+        return texts.map(text => {
+          if (text.includes("PERMANENT_FAILURE")) {
+            failedInputs.push(text);
+            return null;
+          }
+          successfulInputs.push(text);
+          return { embedding: [1, 2, 3], model: FAKE_GGUF_MODEL };
+        });
       },
     };
 
@@ -6016,13 +6093,19 @@ describe("Embedding batching", () => {
     try {
       await insertTestDocument(db, "docs", {
         name: "long-doc",
-        body: "# Long doc\n\n" + "partial embedding regression ".repeat(260),
+        body: "# Long doc\n\nPERMANENT_FAILURE\n\n" + "partial embedding regression ".repeat(260),
       });
 
-      const result = await generateEmbeddings(store);
+      const result = await generateEmbeddings(store, { onProgress: event => { progress.push(event.chunksEmbedded); } });
 
       expect(result.errors).toBeGreaterThan(0);
       expect(result.failures?.[0]?.attempts).toBe(3);
+      expect(new Set(failedInputs).size).toBe(1);
+      // The same input fails in the full batch, the singleton fallback and both retries.
+      expect(failedInputs).toHaveLength(4);
+      expect(successfulInputs.length).toBeGreaterThan(0);
+      expect(progress.some(chunks => chunks > 0)).toBe(true);
+      expect(result.chunksEmbedded).toBe(0);
       expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 0 });
       expect(db.prepare(`SELECT COUNT(*) as count FROM ${VEC_TABLE}`).get()).toEqual({ count: 0 });
       expect(store.getHashesNeedingEmbedding()).toBe(1);
@@ -6037,13 +6120,14 @@ describe("Embedding batching", () => {
     const store = await createTestStore();
     const db = store.db;
     const fakeLlm = {
+      embedModelName: FAKE_GGUF_MODEL,
       ...createFakeTokenizer(),
       async embed(_text: string, _options?: { model?: string }) {
-        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+        return { embedding: [0.1, 0.2, 0.3], model: FAKE_GGUF_MODEL };
       },
       async embedBatch(texts: string[], _options?: { model?: string }) {
         return texts.map((_text, index) => index === 0
-          ? { embedding: [1, 2, 3], model: "fake-embed" }
+          ? { embedding: [1, 2, 3], model: FAKE_GGUF_MODEL }
           : null
         );
       },
@@ -6070,28 +6154,84 @@ describe("Embedding batching", () => {
     }
   });
 
-  test("generateEmbeddings opens a long-lived LLM session for embed runs", async () => {
+  test("generateEmbeddings protects its producer while closeAsync drains the operation", async () => {
     const store = await createTestStore();
     const fakeLlm = createFakeEmbedLlm();
-    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+    const started = deferred<void>();
+    const release = deferred<void>();
+    const events: string[] = [];
+    const embedBatch = fakeLlm.embedBatch.bind(fakeLlm);
+    fakeLlm.embedBatch = async (texts, options) => {
+      const result = await embedBatch(texts, options);
+      started.resolve();
+      await release.promise;
+      events.push("embedding returned");
+      return result;
+    };
+    const dispose = vi.fn(async () => { events.push("producer disposed"); });
+    const closeDb = vi.spyOn(store.db, "close");
+    let run: ReturnType<typeof observeOperation<Awaited<ReturnType<typeof generateEmbeddings>>>> | undefined;
+    let closing: ReturnType<typeof observeOperation<void>> | undefined;
+    let failed = false;
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
+    store.llm = Object.assign(fakeLlm, { dispose }) as any;
+    store.ownsLlm = true;
 
     try {
       await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
 
-      await generateEmbeddings(store);
+      run = observeOperation(generateEmbeddings(store, { onProgress: event => {
+        if (event.chunksEmbedded > 0 && !events.includes("persisted")) events.push("persisted");
+      } }));
+      await Promise.race([started.promise, run.then(outcome => {
+        if (outcome.kind === "error") throw outcome.error;
+        throw new Error("Embedding operation settled before deferred work started");
+      })]);
+      expect(llmModule.canUnloadLLM(store.llm)).toBe(false);
+      expect(() => store.close()).toThrow("active embedding operations");
+      closing = observeOperation(store.closeAsync().then(() => { events.push("store closed"); }));
+      await Promise.resolve();
+      expect(dispose).not.toHaveBeenCalled();
+      expect(closeDb).not.toHaveBeenCalled();
+      expect(events).toEqual([]);
+      await expect(generateEmbeddings(store)).rejects.toThrow("Store is closing");
 
-      expect(sessionSpy).toHaveBeenCalledWith(
-        fakeLlm,
-        expect.any(Function),
-        expect.objectContaining({ maxDuration: 30 * 60 * 1000, name: "generateEmbeddings" }),
-      );
+      release.resolve();
+      const outcome = await run;
+      if (outcome.kind === "error") throw outcome.error;
+      expect(outcome.result.chunksEmbedded).toBe(1);
+      const closed = await closing;
+      if (closed.kind === "error") throw closed.error;
+      expect(llmModule.canUnloadLLM(store.llm)).toBe(true);
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(closeDb).toHaveBeenCalledTimes(1);
+      expect(events).toEqual(["embedding returned", "persisted", "producer disposed", "store closed"]);
+    } catch (error) {
+      failed = true;
+      throw error;
     } finally {
-      sessionSpy.mockRestore();
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
+      release.resolve();
+      try {
+        try {
+          await run;
+          closing ??= observeOperation(store.closeAsync());
+          const closed = await closing;
+          if (closed.kind === "error") throw closed.error;
+        } finally {
+          try {
+            closeDb.mockRestore();
+          } finally {
+            try {
+              setDefaultLlamaCpp(null);
+            } finally {
+              await cleanupTestDb(store);
+            }
+          }
+        }
+      } catch (error) {
+        if (!failed) throw error;
+      }
     }
   });
 
@@ -6101,7 +6241,7 @@ describe("Embedding batching", () => {
 
     // Store is pinned to a 3-dim embed model. Docs AND the query must use it,
     // so the vector table is created as float[3].
-    const storeModel = "hf:store/embeddinggemma-300M.gguf";
+    const storeModel = "hf:store/embeddinggemma-300M/embeddinggemma-300M.gguf";
     const storeLlm = {
       ...createFakeTokenizer(),
       embedModelName: storeModel,
@@ -6118,14 +6258,15 @@ describe("Embedding batching", () => {
     // vector against the float[3] table (the reported dim-mismatch symptom).
     let defaultEmbedCalls = 0;
     const defaultLlm = {
-      // Chunking tokenizes via the global default (chunkDocumentByTokens passes
-      // no tokenizer), so the default must provide tokenize.
-      async tokenize(text: string) {
-        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
-      },
+      ...createFakeTokenizer(),
+      embedModelName: "hf:global/env-8b/env-8b.gguf",
       async embed(_text: string, _options?: { model?: string }) {
         defaultEmbedCalls++;
-        return { embedding: [9, 9, 9, 9], model: "env-8b" };
+        return { embedding: [9, 9, 9, 9], model: this.embedModelName };
+      },
+      async embedBatch(texts: string[]) {
+        defaultEmbedCalls++;
+        return texts.map(() => ({ embedding: [9, 9, 9, 9], model: this.embedModelName }));
       },
     };
 
@@ -6292,7 +6433,7 @@ describe("Embedding batching", () => {
       expect(embedded.chunksCopied).toBe(0);
 
       await insertTestDocument(db, second, { name: "copy", hash: "sharedhash", body: "# Shared\n\nShared body", displayPath: "copy.md" });
-      expect(await store.searchVec("ignored", "test-model", 5, second, undefined, [1, 2, 3])).toEqual([]);
+      expect(await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, second, undefined, [1, 2, 3])).toEqual([]);
       expect(store.getHashesNeedingEmbedding()).toBe(0);
 
       const result = await generateEmbeddings(store);
@@ -6300,9 +6441,9 @@ describe("Embedding batching", () => {
       expect(fakeLlm.embedBatchCalls).toHaveLength(1);
       expect(result.chunksCopied).toBe(1);
       expect(result.chunksEmbedded).toBe(0);
-      const found = await store.searchVec("ignored", "test-model", 5, second, undefined, [1, 2, 3]);
+      const found = await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, second, undefined, [1, 2, 3]);
       expect(found.map((r) => r.displayPath)).toEqual([`${second}/copy.md`]);
-      expect((await store.searchVec("ignored", "test-model", 5, first, undefined, [1, 2, 3])).map((r) => r.displayPath)).toEqual([`${first}/shared.md`]);
+      expect((await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, first, undefined, [1, 2, 3])).map((r) => r.displayPath)).toEqual([`${first}/shared.md`]);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
@@ -6331,7 +6472,7 @@ describe("Embedding batching", () => {
       expect(fakeLlm.embedBatchCalls).toHaveLength(2);
       expect(result.chunksEmbedded).toBe(1);
       expect(result.chunksCopied).toBe(0);
-      expect((await store.searchVec("ignored", "test-model", 5, docs, undefined, [1, 2, 3])).map((r) => r.hash)).toEqual(["losthash"]);
+      expect((await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, docs, undefined, [1, 2, 3])).map((r) => r.hash)).toEqual(["losthash"]);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
@@ -6349,13 +6490,13 @@ describe("Embedding batching", () => {
     })();
   }
 
-  /** `chunks` embedded chunks per hash under the default model, in every collection active for the hash, in one transaction. */
+  /** `chunks` embedded chunks per hash under the fake model, in every collection active for the hash, in one transaction. */
   function seedEmbeddings(store: Store, hashes: readonly string[], chunks = 1): void {
     const now = new Date().toISOString();
     store.db.transaction(() => {
       for (const hash of hashes) {
         for (let seq = 0; seq < chunks; seq++) {
-          store.insertEmbedding(hash, seq, seq * 100, new Float32Array([1, 2, 3]), DEFAULT_EMBED_MODEL, now, chunks);
+          store.insertEmbedding(hash, seq, seq * 100, new Float32Array([1, 2, 3]), FAKE_GGUF_MODEL, now, chunks);
         }
       }
     })();
@@ -6416,7 +6557,7 @@ describe("Embedding batching", () => {
       expect(result.chunksCopied).toBe(hashes.length);
       expect(result.chunksEmbedded).toBe(0);
       expect(vectorRowCount(store, second)).toBe(hashes.length);
-      const found = await store.searchVec("ignored", "test-model", 5, second, undefined, [1, 2, 3]);
+      const found = await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, second, undefined, [1, 2, 3]);
       expect(found).toHaveLength(5);
       expect(found.every((r) => r.collectionName === second)).toBe(true);
       expect(copyVectorsToNewCollections(db)).toEqual({ copied: 0, queued: 0 });
@@ -6468,7 +6609,7 @@ describe("Embedding batching", () => {
       }
       expect(vectorRowCount(store, first)).toBe(singles.length);
       expect(vectorRowCount(store, second)).toBe(singles.length);
-      expect(store.getHashesNeedingEmbedding()).toBe(2);
+      expect(store.getHashesNeedingEmbedding(FAKE_GGUF_MODEL)).toBe(2);
       expect(copyVectorsToNewCollections(db)).toEqual({ copied: 0, queued: 0 });
     } finally {
       await cleanupTestDb(store);
@@ -6501,9 +6642,10 @@ describe("Embedding batching", () => {
         return {
           run: (...params: any[]) => {
             if (params[0] === doomed) throw new Error("injected write failure");
+            const result = stmt.run(...params);
             observed.inserted.push(params[0]);
             observed.insideTransaction.push((real as any).inTransaction);
-            return stmt.run(...params);
+            return result;
           },
           get: (...params: any[]) => stmt.get(...params),
           all: (...params: any[]) => stmt.all(...params),
@@ -6518,6 +6660,7 @@ describe("Embedding batching", () => {
       },
       exec: (sql: string) => real.exec(sql),
       loadExtension: (path: string) => real.loadExtension(path),
+      get inTransaction() { return (real as any).inTransaction; },
       close: () => real.close(),
     };
 
@@ -6530,18 +6673,16 @@ describe("Embedding batching", () => {
       await insertTestDocument(real, "docs", { name: "two", hash: doomed, body: "# Two\n\nBeta" });
       await insertTestDocument(real, "docs", { name: "three", hash: "threehash", body: "# Three\n\nGamma" });
 
-      const result = await generateEmbeddings(store);
-
+      await expect(generateEmbeddings(store)).rejects.toThrow("injected write failure");
       expect(fakeLlm.embedBatchCalls).toHaveLength(1);
       expect(observed.inserted[0]).toBe("onehash");
       expect(observed.insideTransaction.every(Boolean)).toBe(true);
       expect(observed.firstHashRowsAfterRollback).toBe(0);
-      expect(result.errors).toBe(1);
-      expect(result.failures?.[0]?.hash).toBe(doomed);
+      expect(real.inTransaction).toBe(false);
+      expect(rowsOf("onehash")).toBe(0);
       expect(rowsOf(doomed)).toBe(0);
-      expect(rowsOf("onehash")).toBe(1);
-      expect(rowsOf("threehash")).toBe(1);
-      expect(store.getHashesNeedingEmbedding()).toBe(1);
+      expect(rowsOf("threehash")).toBe(0);
+      expect(store.getHashesNeedingEmbedding(FAKE_GGUF_MODEL)).toBe(3);
     } finally {
       store.db = real;
       setDefaultLlamaCpp(null);
@@ -6554,8 +6695,9 @@ describe("Embedding batching", () => {
     const db = store.db;
     const near = [1, 0, 0];
     const far = [0, 1, 0];
-    const embeddingFor = (text: string) => ({ embedding: text.includes("stale") ? near : far, model: "fake-embed" });
+    const embeddingFor = (text: string) => ({ embedding: text.includes("stale") ? near : far, model: FAKE_GGUF_MODEL });
     const fakeLlm = {
+      embedModelName: FAKE_GGUF_MODEL,
       ...createFakeTokenizer(),
       async embed(text: string, _options?: { model?: string }) { return embeddingFor(text); },
       async embedBatch(texts: string[], _options?: { model?: string }) { return texts.map(embeddingFor); },
@@ -6579,14 +6721,14 @@ describe("Embedding batching", () => {
       // Four stale rows sit nearer the query than both live documents and take
       // every one of the first scoped KNN's three slots at limit 1; the search
       // only answers after widening its KNN past them.
-      expect(await store.searchVec("ignored", "test-model", 1, "docs", undefined, near)).toHaveLength(1);
+      expect(await store.searchVec("ignored", FAKE_GGUF_MODEL, 1, "docs", undefined, near)).toHaveLength(1);
 
       expect(cleanupOrphanedVectors(db)).toBe(4);
 
       expect(db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE}`).get()).toEqual({ c: 2 });
-      const after = await store.searchVec("ignored", "test-model", 1, "docs", undefined, near);
+      const after = await store.searchVec("ignored", FAKE_GGUF_MODEL, 1, "docs", undefined, near);
       expect(after).toHaveLength(1);
-      expect(await store.searchVec("ignored", "test-model", 5, "docs", undefined, near)).toHaveLength(2);
+      expect(await store.searchVec("ignored", FAKE_GGUF_MODEL, 5, "docs", undefined, near)).toHaveLength(2);
     } finally {
       setDefaultLlamaCpp(null);
       await rm(dir, { recursive: true, force: true });
@@ -6660,8 +6802,16 @@ describe("Embedding batching", () => {
 
   test("generateEmbeddings rejects invalid batch limits", async () => {
     const store = await createTestStore();
+    const collectionPath = join(testDir, `batch-limit-${Date.now()}`);
+    await mkdir(collectionPath, { recursive: true });
+    await writeFile(join(collectionPath, "a.md"), "body");
+    await reindexCollection(store, collectionPath, "**/*.md", "batch-limit");
 
     try {
+      const fakeLlm = createFakeEmbedLlm();
+      fakeLlm.embedModelName = FAKE_GGUF_MODEL;
+      setDefaultLlamaCpp(createFakeTokenizer() as any);
+      store.llm = fakeLlm as any;
       await expect(generateEmbeddings(store, { maxDocsPerBatch: 0 })).rejects.toThrow(
         "maxDocsPerBatch"
       );

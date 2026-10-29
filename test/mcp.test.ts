@@ -10,12 +10,12 @@ import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm.js";
 import { unlinkSync } from "node:fs";
-import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
+import { mkdtemp, writeFile, readdir, unlink, rmdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
 import type { CollectionConfig } from "../src/collections.js";
-import { setConfigIndexName } from "../src/collections.js";
+import { setConfigIndexName, setConfigSource } from "../src/collections.js";
 import { syncConfigToDb } from "../src/store.js";
 import { initializeMetadataSchema } from "../src/metadata-store.js";
 import { VEC_TABLE, createVectorMetadataTables, vecLayout } from "../src/vec-layout.js";
@@ -234,7 +234,12 @@ import type { RankedResult } from "../src/store.js";
 // =============================================================================
 
 describe("MCP Server", () => {
+  let setupFailed = true;
+  let databaseClosed = false;
+  let origConfigDirValue: string | undefined;
+
   beforeAll(async () => {
+    origConfigDirValue = process.env.QMD_CONFIG_DIR;
     // LlamaCpp uses node-llama-cpp for local model inference (no HTTP mocking needed)
     // Use shared singleton to avoid creating multiple instances with separate GPU resources
     getDefaultLlamaCpp();
@@ -242,9 +247,8 @@ describe("MCP Server", () => {
     // Reset index name in case another test file mutated it (bun test shares process)
     setConfigIndexName("index");
 
-    // Set up test config directory
-    const configPrefix = join(tmpdir(), `qmd-mcp-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    testConfigDir = await mkdtemp(configPrefix);
+    // Set up owned test config directory (directory root also hosts DB)
+    testConfigDir = await mkdtemp(join(tmpdir(), "qmd-mcp-config-"));
     process.env.QMD_CONFIG_DIR = testConfigDir;
 
     // Create YAML config with test collection
@@ -261,31 +265,31 @@ describe("MCP Server", () => {
     };
     await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(testConfig));
 
-    testDbPath = `/tmp/qmd-mcp-test-${Date.now()}.sqlite`;
-    testDb = openDatabase(testDbPath);
-    initTestDatabase(testDb);
-    seedTestData(testDb);
-
-    // Sync YAML config into SQLite store_collections
-    syncConfigToDb(testDb, testConfig);
+    testDbPath = join(testConfigDir, "test.sqlite");
+    try {
+      testDb = openDatabase(testDbPath);
+      initTestDatabase(testDb);
+      seedTestData(testDb);
+      syncConfigToDb(testDb, testConfig);
+      setupFailed = false;
+    } catch (e) {
+      setupFailed = true;
+      if (testDb) { try { testDb.close(); databaseClosed = true; } catch {} }
+      throw e;
+    }
   });
 
   afterAll(async () => {
-    testDb.close();
+    const errors: unknown[] = [];
+    if (testDb && !databaseClosed) {
+      try { testDb.close(); databaseClosed = true; } catch (e) { errors.push(e); }
+    }
     try {
-      unlinkSync(testDbPath);
-    } catch {}
-
-    // Clean up test config directory
-    try {
-      const files = await readdir(testConfigDir);
-      for (const file of files) {
-        await unlink(join(testConfigDir, file));
-      }
-      await rmdir(testConfigDir);
-    } catch {}
-
-    delete process.env.QMD_CONFIG_DIR;
+      if (origConfigDirValue !== undefined) process.env.QMD_CONFIG_DIR = origConfigDirValue;
+      else delete process.env.QMD_CONFIG_DIR;
+    } catch (e) { errors.push(e); }
+    try { if (testConfigDir) await rm(testConfigDir, { recursive: true, force: true }); } catch (e) { errors.push(e); }
+    if (!setupFailed && errors.length > 0) throw errors[0];
   });
 
   // ===========================================================================
@@ -1255,47 +1259,60 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
   let baseUrl: string;
   let dbPath: string;
   let configDir: string | undefined;
-  const origIndexPath = process.env.INDEX_PATH;
-  const origConfigDir = process.env.QMD_CONFIG_DIR;
+  let setupFailed = true;
+  let origIndexPathValue: string | undefined;
+  let origConfigDirValue: string | undefined;
 
   beforeAll(async () => {
-    dbPath = `/tmp/qmd-mcp-http-2026-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`;
-    const db = openDatabase(dbPath);
-    initTestDatabase(db);
-    seedTestData(db);
-    const testConfig: CollectionConfig = {
-      collections: {
-        docs: { path: "/test/docs", pattern: "**/*.md" },
-      },
-    };
-    syncConfigToDb(db, testConfig);
-    db.close();
-
-    const configPrefix = join(tmpdir(), `qmd-mcp-http-2026-config-${Date.now()}-`);
-    configDir = await mkdtemp(configPrefix);
-    await writeFile(join(configDir, "index.yml"), YAML.stringify(testConfig));
+    origIndexPathValue = process.env.INDEX_PATH;
+    origConfigDirValue = process.env.QMD_CONFIG_DIR;
+    configDir = await mkdtemp(join(tmpdir(), "qmd-mcp-http-2026-"));
+    dbPath = join(configDir, "test.sqlite");
+    let db: Database | undefined;
+    try {
+      db = openDatabase(dbPath);
+      initTestDatabase(db);
+      seedTestData(db);
+      const testConfig: CollectionConfig = {
+        collections: {
+          docs: { path: "/test/docs", pattern: "**/*.md" },
+        },
+      };
+      syncConfigToDb(db, testConfig);
+      db.close();
+      db = undefined;
+      await writeFile(join(configDir, "index.yml"), YAML.stringify(testConfig));
+    } catch (e) {
+      setupFailed = true;
+      if (db) { try { db.close(); } catch {} db = undefined; }
+      throw e;
+    }
 
     process.env.INDEX_PATH = dbPath;
     process.env.QMD_CONFIG_DIR = configDir;
+    setConfigSource({ configPath: join(configDir, "index.yml") });
     handle = await startMcpHttpServer(0, { quiet: true, dbPath });
     baseUrl = `http://localhost:${handle.port}`;
+    setupFailed = false;
   });
 
   afterAll(async () => {
-    if (handle) await handle.stop();
-    _resetProductionModeForTesting();
-    if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
-    else delete process.env.INDEX_PATH;
-    if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
-    else delete process.env.QMD_CONFIG_DIR;
-    try { unlinkSync(dbPath); } catch {}
-    if (configDir) {
-      try {
-        const files = await readdir(configDir);
-        for (const f of files) await unlink(join(configDir, f));
-        await rmdir(configDir);
-      } catch {}
-    }
+    const errors: unknown[] = [];
+    try {
+      if (handle) await handle.stop();
+    } catch (e) { errors.push(e); }
+    try { _resetProductionModeForTesting(); } catch (e) { errors.push(e); }
+    setConfigSource(undefined);
+    try {
+      if (origIndexPathValue !== undefined) process.env.INDEX_PATH = origIndexPathValue;
+      else delete process.env.INDEX_PATH;
+      if (origConfigDirValue !== undefined) process.env.QMD_CONFIG_DIR = origConfigDirValue;
+      else delete process.env.QMD_CONFIG_DIR;
+    } catch (e) { errors.push(e); }
+    try {
+      if (configDir) await rm(configDir, { recursive: true, force: true });
+    } catch (e) { errors.push(e); }
+    if (!setupFailed && errors.length > 0) throw errors[0];
   });
 
   async function postMcp(
@@ -1554,49 +1571,72 @@ describe("MCP HTTP Transport — legacy FTS seed (#792)", () => {
   test("startMcpHttpServer opens a DB seeded like the MCP helper (name/body + content='documents')", async () => {
     const origIndexPath = process.env.INDEX_PATH;
     const origConfigDir = process.env.QMD_CONFIG_DIR;
-    const dbPath = `/tmp/qmd-mcp-http-legacy-fts-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`;
+    const ownedDbDir = await mkdtemp(join(tmpdir(), "qmd-mcp-http-legacy-db-"));
+    const dbPath = join(ownedDbDir, "test.sqlite");
     let configDir: string | undefined;
     let handle: HttpServerHandle | undefined;
+    let bodyFailed = false;
+    const cleanupErrors: unknown[] = [];
 
     try {
-      const db = openDatabase(dbPath);
-      initTestDatabase(db);
-      seedTestData(db);
       const testConfig: CollectionConfig = {
         collections: {
           docs: { path: "/test/docs", pattern: "**/*.md" },
         },
       };
-      syncConfigToDb(db, testConfig);
-      db.close();
 
-      const configPrefix = join(tmpdir(), `qmd-mcp-http-legacy-config-${Date.now()}-`);
-      configDir = await mkdtemp(configPrefix);
+      let db: Database | undefined;
+      try {
+        db = openDatabase(dbPath);
+        initTestDatabase(db);
+        seedTestData(db);
+        syncConfigToDb(db, testConfig);
+        db.close();
+        db = undefined;
+      } catch (e) {
+        if (db) { try { db.close(); } catch {} }
+        throw e;
+      }
+
+      configDir = await mkdtemp(join(tmpdir(), "qmd-mcp-http-legacy-config-"));
       await writeFile(join(configDir, "index.yml"), YAML.stringify(testConfig));
 
       process.env.INDEX_PATH = dbPath;
       process.env.QMD_CONFIG_DIR = configDir;
 
+      setConfigSource({ configPath: join(configDir, "index.yml") });
       handle = await startMcpHttpServer(0, { quiet: true, dbPath });
       const res = await fetch(`http://localhost:${handle.port}/health`);
       expect(res.status).toBe(200);
       const body = await res.json() as { status?: string };
       expect(body.status).toBe("ok");
+    } catch (e) {
+      bodyFailed = true;
+      throw e;
     } finally {
-      if (handle) await handle.stop();
-      _resetProductionModeForTesting();
-      if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
-      else delete process.env.INDEX_PATH;
-      if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
-      else delete process.env.QMD_CONFIG_DIR;
-      try { unlinkSync(dbPath); } catch {}
-      if (configDir) {
-        try {
-          const files = await readdir(configDir);
-          for (const f of files) await unlink(join(configDir, f));
-          await rmdir(configDir);
-        } catch {}
+      try {
+        if (handle) await handle.stop();
+      } catch (e) {
+        if (!bodyFailed) cleanupErrors.push(e);
       }
+      try { _resetProductionModeForTesting(); }
+      catch (e) { if (!bodyFailed) cleanupErrors.push(e); }
+      setConfigSource(undefined);
+      try {
+        if (origIndexPath !== undefined) process.env.INDEX_PATH = origIndexPath;
+        else delete process.env.INDEX_PATH;
+        if (origConfigDir !== undefined) process.env.QMD_CONFIG_DIR = origConfigDir;
+        else delete process.env.QMD_CONFIG_DIR;
+      } catch (e) {
+        if (!bodyFailed) cleanupErrors.push(e);
+      }
+      // Both roots were allocated by this test; attempt each cleanup independently.
+      for (const directory of [ownedDbDir, configDir]) {
+        if (directory === undefined) continue;
+        try { await rm(directory, { recursive: true, force: true }); }
+        catch (e) { if (!bodyFailed) cleanupErrors.push(e); }
+      }
+      if (!bodyFailed && cleanupErrors.length > 0) throw cleanupErrors[0];
     }
   });
 });

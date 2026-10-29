@@ -11,12 +11,15 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isBun } from "../../src/db.ts";
 import { createStore, maybeAdoptLegacyEmbeddingFingerprint } from "../../src/store.ts";
-import { heapLimitBinds } from "./heap-limit.ts";
+import { verifyHeapLimit } from "./heap-limit.ts";
 
 const model = "model";
 const dir = mkdtempSync(join(tmpdir(), "qmd-legacy-shared-body-"));
 const store = createStore(join(dir, "index.sqlite"));
+const strict = process.env.QMD_TEST_SQLITE_MEMORY_STRICT === "1";
+const budgetBytes = 16777216;
 try {
   const body = "word ".repeat(209_716); // About 1 MiB.
   store.insertContent("shared", body, "2026-01-01");
@@ -35,9 +38,12 @@ try {
   } as any;
 
   store.db.exec("PRAGMA temp_store = MEMORY");
-  store.db.exec("PRAGMA hard_heap_limit = 16777216");
+  store.db.exec(`PRAGMA hard_heap_limit = ${budgetBytes}`);
+
+  const binds = verifyHeapLimit(store.db, budgetBytes, strict);
+
   const result = await maybeAdoptLegacyEmbeddingFingerprint(store, model);
-  console.log(JSON.stringify({ checked: result.checked, adopted: result.adopted, limitBinds: heapLimitBinds(store.db, 16777216) }));
+  console.log(JSON.stringify({ checked: result.checked, adopted: result.adopted, limitBinds: binds, runtime: isBun ? "bun" : "node", budgetBytes }));
 } finally {
   store.close();
   rmSync(dir, { recursive: true, force: true });

@@ -45,6 +45,8 @@ import {
   deleteLLMCache,
   deleteInactiveDocuments,
   clearAllEmbeddings,
+  configureStoreEmbeddings,
+  DEFAULT_EMBED_MODEL,
   type Store as InternalStore,
   type DocumentResult,
   type DocumentNotFound,
@@ -69,6 +71,9 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import { availableParallelism } from "node:os";
+import { resolveEmbeddingConfig } from "./embeddings/config.js";
+import type { ResolvedEmbeddingConfig } from "./embeddings/types.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -111,6 +116,7 @@ import {
   addContext as collectionsAddContext,
   removeContext as collectionsRemoveContext,
   setGlobalContext as collectionsSetGlobalContext,
+  parseCollectionConfig,
   type Collection,
   type CollectionConfig,
   type NamedCollection,
@@ -176,6 +182,8 @@ export { MetadataBindingBudgetError, MetadataOptionError };
 
 // Re-export the internal Store type for advanced consumers
 export type { InternalStore };
+export type { ModelsConfig } from "./collections.js";
+export type { OnnxModelSource, OnnxEmbeddingConfig, EmbeddingRecipe } from "./embeddings/types.js";
 
 // Re-export utility functions and types used by frontends
 export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
@@ -224,7 +232,7 @@ export interface SearchOptions {
   queries?: ExpandedQuery[];
   /** Domain intent hint — steers reranking and snippet/chunk selection */
   intent?: string;
-  /** Rerank results using LLM (default: true) */
+  /** Rerank using the configured stage policy; CPU-only ONNX disables it and rejects explicit true. */
   rerank?: boolean;
   /** Filter to a specific collection */
   collection?: string;
@@ -399,6 +407,7 @@ export interface QMDStore {
     maxBatchBytes?: number;
     chunkStrategy?: ChunkStrategy;
     onProgress?: (info: EmbedProgress) => void;
+    signal?: AbortSignal;
   }): Promise<EmbedResult>;
 
   // ── Index Health ────────────────────────────────────────────────────
@@ -448,11 +457,12 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     throw new Error("Provide either configPath or config, not both");
   }
 
+  // Validate/copy inline JavaScript configuration before opening or syncing a DB.
+  const inlineConfig = options.config === undefined ? undefined : parseCollectionConfig(options.config);
+
   // Create the internal store (opens DB, creates tables)
   const internal = createStoreInternal(options.dbPath);
   const db = internal.db;
-
-  // Track whether we have a YAML config path for write-through
   const hasYamlConfig = !!options.configPath;
 
   // Sync config into SQLite store_collections
@@ -460,26 +470,52 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   if (options.configPath) {
     // YAML mode: inject config source for write-through, sync to DB
     setConfigSource({ configPath: options.configPath });
-    config = loadConfig();
-    syncConfigToDb(db, config);
+    try {
+      config = loadConfig();
+      syncConfigToDb(db, config);
+    } catch (error) {
+      await internal.closeAsync();
+      throw error;
+    }
   } else if (options.config) {
     // Inline config mode: inject config source for mutations, sync to DB
     setConfigSource({ config: options.config });
-    config = options.config;
-    syncConfigToDb(db, config);
+    config = inlineConfig;
+    try { if (config !== undefined) syncConfigToDb(db, config); }
+    catch (error) { await internal.closeAsync(); throw error; }
   }
   // else: DB-only mode — no external config, use existing store_collections
 
+  let embeddingConfig: ResolvedEmbeddingConfig | undefined;
+  try {
+    embeddingConfig = config === undefined ? undefined : resolveEmbeddingConfig(config.models?.embed, {
+      configPath: options.configPath,
+      legacyEnv: process.env.QMD_EMBED_MODEL,
+      defaultGgufModel: DEFAULT_EMBED_MODEL,
+      hostParallelism: availableParallelism(),
+    });
+  } catch (error) {
+    await internal.closeAsync();
+    throw error;
+  }
+
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    embedModel: config?.models?.embed,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
-  });
-  internal.llm = llm;
+  try {
+    const llm = new LlamaCpp({
+      embedModel: embeddingConfig?.backend === "gguf" ? embeddingConfig.model : undefined,
+      generateModel: config?.models?.generate,
+      rerankModel: config?.models?.rerank,
+      inactivityTimeoutMs: 5 * 60 * 1000,
+      disposeModelsOnInactivity: true,
+    });
+    internal.llm = llm;
+    internal.ownsLlm = true;
+    if (embeddingConfig !== undefined) configureStoreEmbeddings(internal, embeddingConfig);
+  } catch (error) {
+    await internal.closeAsync();
+    throw error;
+  }
 
   const store: QMDStore = {
     internal,
@@ -487,6 +523,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Search
     search: async (opts) => {
+      if (opts.rerank !== undefined && typeof opts.rerank !== "boolean") throw new TypeError("search.rerank must be a boolean");
       if (!opts.query && !opts.queries) {
         throw new Error("search() requires either 'query' or 'queries'");
       }
@@ -495,7 +532,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ...(opts.collection ? [opts.collection] : []),
         ...(opts.collections ?? []),
       ];
-      const skipRerank = opts.rerank === false;
+      const skipRerank = opts.rerank === undefined ? undefined : !opts.rerank;
       // The SDK is also a JavaScript boundary: TypeScript declarations do not
       // protect plain-JS callers or deserialized input. Apply the same bounded,
       // strict validation used by CLI, MCP, and HTTP before compiling SQL.
@@ -535,7 +572,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
     searchVector: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
-      return internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, filter);
+      return internal.searchVec(q, internal.embedding?.modelLabel ?? internal.llm?.embedModelName ?? DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection, undefined, undefined, filter);
     },
     expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
@@ -658,6 +695,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         maxBatchBytes: embedOpts?.maxBatchBytes,
         chunkStrategy: embedOpts?.chunkStrategy,
         onProgress: embedOpts?.onProgress,
+        signal: embedOpts?.signal,
       });
     },
 
@@ -666,13 +704,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     getIndexHealth: async () => internal.getIndexHealth(),
 
     // Lifecycle
-    close: async () => {
-      await llm.dispose();
-      internal.close();
-      if (hasYamlConfig || options.config) {
-        setConfigSource(undefined); // Reset config source
-      }
-    },
+    close: () => internal.closeAsync(),
   };
 
   return store;

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Use `better-sqlite3` for SQLite connections under both Node.js and Bun, rather than selecting Bun's built-in SQLite driver.
+- Separate functional SQLite regression tests from strict memory qualification. The strict gate retains the 16 MiB and 32 MiB limits on both runtimes and requires verified heap-limit enforcement; passing the functional suite alone does not establish those budgets.
+
+### Added
+
+- ONNX embedding backend (opt-in); CPU-default with explicitly configurable acceleration; descriptor/recipe/manifest identity, same-dimension space mismatch rejection, and CPU-only deterministic search policy (original-query BM25+vector, no expansion/rerank, stage conflict handled). Preserves existing GGUF full-force workflow. Runtime/hardware/relevance/performance claims deferred to T18 runtime-qualification.
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,
